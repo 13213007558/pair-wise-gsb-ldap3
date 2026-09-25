@@ -455,7 +455,19 @@ def checked_attributes_to_dict_fast(attribute_list, schema=None, custom_formatte
 
 
 def matching_rule_assertion_to_string(matching_rule_assertion):
-    return str(matching_rule_assertion)
+    # MatchingRuleAssertion ::= SEQUENCE {
+    #     matchingRule    [1] MatchingRuleId OPTIONAL,
+    #     type            [2] AttributeDescription OPTIONAL,
+    #     matchValue      [3] AssertionValue,
+    #     dnAttributes    [4] BOOLEAN DEFAULT FALSE }
+    # rebuilds the extensible filter as per RFC 4515: [attr][:dn][:matchingrule]:=value
+    assertion = str(matching_rule_assertion['type']) if matching_rule_assertion['type'].hasValue() else ''
+    if matching_rule_assertion['dnAttributes'].hasValue() and matching_rule_assertion['dnAttributes']:
+        assertion += ':dn'
+    if matching_rule_assertion['matchingRule'].hasValue():
+        assertion += ':' + str(matching_rule_assertion['matchingRule'])
+    assertion += ':=' + to_unicode(bytes(matching_rule_assertion['matchValue']), from_server=True)
+    return assertion
 
 
 def filter_to_string(filter_object):

@@ -27,6 +27,7 @@ import json
 import re
 
 from random import SystemRandom
+from string import hexdigits
 
 from pyasn1.type.univ import OctetString
 
@@ -42,12 +43,13 @@ from ..operation.search import search_request_to_dict, parse_filter, ROOT, AND, 
     MATCH_GREATER_OR_EQUAL, MATCH_LESS_OR_EQUAL, MATCH_EXTENSIBLE, MATCH_PRESENT,\
     MATCH_SUBSTRING, MATCH_EQUAL
 from ..utils.conv import json_hook, to_unicode, to_raw
-from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
+from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError, LDAPInvalidDnError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
-    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
+    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN, \
+    RESULT_INAPPROPRIATE_MATCHING
 from ..utils.ciDict import CaseInsensitiveDict
-from ..utils.dn import to_dn, safe_dn, safe_rdn
+from ..utils.dn import to_dn, safe_dn, safe_rdn, parse_dn
 from ..protocol.sasl.sasl import validate_simple_password
 from ..protocol.formatters.standard import find_attribute_validator, format_attribute_values
 from ..protocol.rfc2696 import paged_search_control
@@ -117,6 +119,24 @@ from ..protocol.convert import build_controls_list
 SEARCH_CONTROLS = ['1.2.840.113556.1.4.319'  # simple paged search [RFC 2696]
                    ]
 SERVER_ENCODING = 'utf-8'
+
+# well-known matching rules evaluated by the mock strategies in extensible match filters:
+# rule oid -> (rule name, oid of the syntax the rule applies to)
+MOCK_MATCHING_RULES = {
+    '2.5.13.1': ('distinguishedNameMatch', '1.3.6.1.4.1.1466.115.121.1.12'),  # DN syntax
+    '2.5.13.2': ('caseIgnoreMatch', '1.3.6.1.4.1.1466.115.121.1.15'),  # Directory String syntax
+    '2.5.13.5': ('caseExactMatch', '1.3.6.1.4.1.1466.115.121.1.15'),  # Directory String syntax
+    '2.5.13.14': ('integerMatch', '1.3.6.1.4.1.1466.115.121.1.27'),  # Integer syntax
+}
+
+
+class MockMatchError(Exception):
+    """Raised while evaluating a mock search filter, carries the LDAP result to return to the client"""
+
+    def __init__(self, result_code, message):
+        self.result_code = result_code
+        self.message = message
+        Exception.__init__(self, message)
 
 
 def random_cookie():
@@ -694,7 +714,15 @@ class MockBaseStrategy(object):
             result_code = RESULT_NO_SUCH_OBJECT
             message = 'incorrect base object'
         else:
-            matched = self.evaluate_filter_node(filter_root, candidates)
+            try:
+                matched = self.evaluate_filter_node(filter_root, candidates)
+            except MockMatchError as e:  # filter cannot be evaluated, returns a proper LDAP result
+                result = {'resultCode': e.result_code,
+                          'matchedDN': '',
+                          'diagnosticMessage': to_unicode(e.message, SERVER_ENCODING),
+                          'referral': None
+                          }
+                return [], result
             if self.connection.raise_exceptions and 0 < request['sizeLimit'] < len(matched):
                 result_code = 4
                 message = 'size limit exceeded'
@@ -829,10 +857,7 @@ class MockBaseStrategy(object):
                             else:
                                 node.unmatched.add(candidate)
         elif node.tag == MATCH_EXTENSIBLE:
-            self.connection.last_error = 'Extensible match not allowed in Mock strategy'
-            if log_enabled(ERROR):
-                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-            raise LDAPDefinitionError(self.connection.last_error)
+            self.evaluate_extensible_match_node(node, candidates)
         elif node.tag == MATCH_PRESENT:
             attr_name = node.assertion['attr']
             for candidate in candidates:
@@ -876,6 +901,260 @@ class MockBaseStrategy(object):
                     node.matched.add(candidate)
                 else:
                     node.unmatched.add(candidate)
+
+    def evaluate_extensible_match_node(self, node, candidates):
+        """Evaluates an extensible match filter item against the candidates, interpreting the
+        matching rule as per the server schema. Rules that cannot be honored raise MockMatchError
+        so that a proper LDAP result is returned to the client"""
+        schema = self.connection.server.schema
+        attribute_name = node.assertion['attr'] if node.assertion['attr'] else None
+        matching_rule = node.assertion['matchingRule'] if node.assertion['matchingRule'] else None
+        dn_attributes = True if node.assertion['dnAttributes'] else False
+
+        if matching_rule:
+            rule_oid, rule_syntax = self._resolve_matching_rule(matching_rule, schema)
+        else:  # no matching rule requested, the equality rule of the attribute is used
+            rule_oid, rule_syntax = self._attribute_equality_rule(attribute_name, schema)
+
+        assertion = self._prepare_extensible_assertion(rule_oid, node.assertion['value'])
+
+        if attribute_name and schema is not None and schema.attribute_types:
+            attribute_syntax = self._attribute_syntax(attribute_name, schema)
+            if attribute_syntax is not None and attribute_syntax != rule_syntax:
+                message = 'matching rule <' + str(matching_rule or rule_oid) + '> not applicable to attribute <' + attribute_name + '>'
+                if log_enabled(ERROR):
+                    log(ERROR, '<%s> for <%s>', message, self.connection)
+                raise MockMatchError(RESULT_INAPPROPRIATE_MATCHING, message)
+
+        for candidate in candidates:
+            entry = self.connection.server.dit[candidate]
+            matched = False
+            if attribute_name:
+                values = self._entry_attribute_values(entry, attribute_name, schema)
+                if values is not None and self._matching_rule_applies(attribute_name, rule_syntax, schema):
+                    matched = self._match_extensible_values(rule_oid, values, assertion, schema)
+            else:  # no attribute requested, the rule is applied to all the attributes it is appropriate for
+                for entry_attribute in entry:
+                    if self._matching_rule_applies(entry_attribute, rule_syntax, schema):
+                        values = entry[entry_attribute]
+                        if not isinstance(values, SEQUENCE_TYPES):
+                            values = [values]
+                        if self._match_extensible_values(rule_oid, values, assertion, schema):
+                            matched = True
+                            break
+            if not matched and dn_attributes:  # the rule is applied to the attributes of the entry dn too
+                try:
+                    rdns = parse_dn(candidate, escape=True, strip=True)
+                except LDAPInvalidDnError:
+                    rdns = []
+                for rdn_attribute, rdn_value, _ in rdns:
+                    if attribute_name and not self._same_attribute_type(rdn_attribute, attribute_name, schema):
+                        continue
+                    if not self._matching_rule_applies(rdn_attribute, rule_syntax, schema):
+                        continue
+                    if self._match_extensible_values(rule_oid, [self._unescape_dn_value(rdn_value)], assertion, schema):
+                        matched = True
+                        break
+            if matched:
+                node.matched.add(candidate)
+            else:
+                node.unmatched.add(candidate)
+
+    def _resolve_matching_rule(self, matching_rule, schema):
+        """Returns the oid and the assertion syntax of the requested matching rule, as known by the
+        server schema or by the table of well-known rules. Raises MockMatchError when the rule
+        cannot be honored"""
+        if schema is not None and schema.matching_rules:
+            try:
+                rule_info = schema.matching_rules[matching_rule]
+            except KeyError:
+                rule_info = None
+            if rule_info is not None and rule_info.oid in MOCK_MATCHING_RULES:
+                return rule_info.oid, rule_info.syntax or MOCK_MATCHING_RULES[rule_info.oid][1]
+        for rule_oid, (rule_name, rule_syntax) in MOCK_MATCHING_RULES.items():
+            if matching_rule.lower() == rule_name.lower() or matching_rule == rule_oid:
+                return rule_oid, rule_syntax
+        message = 'unrecognized matching rule <' + str(matching_rule) + '>'
+        if log_enabled(ERROR):
+            log(ERROR, '<%s> for <%s>', message, self.connection)
+        raise MockMatchError(RESULT_INAPPROPRIATE_MATCHING, message)
+
+    def _attribute_equality_rule(self, attribute_name, schema):
+        """Returns the oid and the assertion syntax of the equality matching rule of the attribute,
+        walking up the attribute type hierarchy. Defaults to caseIgnoreMatch"""
+        if attribute_name and schema is not None and schema.attribute_types:
+            seen = set()
+            current = attribute_name
+            while current:
+                if current.lower() in seen:
+                    break
+                seen.add(current.lower())
+                try:
+                    attribute_info = schema.attribute_types[current]
+                except KeyError:
+                    break
+                if attribute_info.equality:
+                    equality = attribute_info.equality[0]
+                    for rule_oid, (rule_name, rule_syntax) in MOCK_MATCHING_RULES.items():
+                        if equality.lower() == rule_name.lower() or equality == rule_oid:
+                            return rule_oid, rule_syntax
+                    break  # equality rule not honored by the mock strategies, defaults to caseIgnoreMatch
+                current = attribute_info.superior[0] if attribute_info.superior else None
+        return '2.5.13.2', MOCK_MATCHING_RULES['2.5.13.2'][1]  # caseIgnoreMatch
+
+    def _attribute_syntax(self, attribute_name, schema):
+        """Returns the syntax oid of the attribute, walking up the attribute type hierarchy.
+        Returns None when the syntax cannot be determined"""
+        seen = set()
+        current = attribute_name
+        while current:
+            if current.lower() in seen:
+                return None
+            seen.add(current.lower())
+            try:
+                attribute_info = schema.attribute_types[current]
+            except KeyError:
+                return None
+            if attribute_info.syntax:
+                return attribute_info.syntax
+            current = attribute_info.superior[0] if attribute_info.superior else None
+        return None
+
+    def _matching_rule_applies(self, attribute_name, rule_syntax, schema):
+        """A matching rule applies to an attribute when the attribute syntax (inherited from its
+        superiors) is the same as the assertion syntax of the rule. Without a schema the rule
+        is applied to any attribute"""
+        if schema is None or not schema.attribute_types:
+            return True
+        attribute_syntax = self._attribute_syntax(attribute_name, schema)
+        return attribute_syntax is not None and attribute_syntax == rule_syntax
+
+    def _entry_attribute_values(self, entry, attribute_name, schema):
+        """Returns the values of the attribute in the entry, considering the aliases of the
+        attribute type. Returns None when the attribute is not present"""
+        names = [attribute_name]
+        if schema is not None and schema.attribute_types:
+            try:
+                attribute_info = schema.attribute_types[attribute_name]
+                if attribute_info.name:
+                    names.extend(attribute_info.name)
+                if attribute_info.oid:
+                    names.append(attribute_info.oid)
+            except KeyError:
+                pass
+        for name in names:
+            if name in entry:
+                values = entry[name]
+                return values if isinstance(values, SEQUENCE_TYPES) else [values]
+        return None
+
+    def _prepare_extensible_assertion(self, rule_oid, assertion):
+        """Validates and converts the assertion value as per the matching rule syntax.
+        Raises MockMatchError when the assertion cannot be parsed"""
+        assertion = to_unicode(ldap_escape_to_bytes(assertion), SERVER_ENCODING)
+        if rule_oid == '2.5.13.14':  # integerMatch
+            try:
+                return int(assertion.strip())
+            except (TypeError, ValueError):
+                message = 'invalid assertion value <' + assertion + '> for integerMatch'
+                if log_enabled(ERROR):
+                    log(ERROR, '<%s> for <%s>', message, self.connection)
+                raise MockMatchError(RESULT_INAPPROPRIATE_MATCHING, message)
+        if rule_oid == '2.5.13.1':  # distinguishedNameMatch
+            try:
+                return self._dn_to_rdns(assertion)
+            except LDAPInvalidDnError:
+                message = 'invalid assertion value <' + assertion + '> for distinguishedNameMatch'
+                if log_enabled(ERROR):
+                    log(ERROR, '<%s> for <%s>', message, self.connection)
+                raise MockMatchError(RESULT_INAPPROPRIATE_MATCHING, message)
+        return self._normalize_string_value(assertion)
+
+    def _match_extensible_values(self, rule_oid, values, assertion, schema):
+        for value in values:
+            try:
+                if rule_oid == '2.5.13.14':  # integerMatch
+                    if int(to_unicode(value, SERVER_ENCODING).strip()) == assertion:
+                        return True
+                elif rule_oid == '2.5.13.1':  # distinguishedNameMatch
+                    if self._rdns_equal(self._dn_to_rdns(to_unicode(value, SERVER_ENCODING)), assertion, schema):
+                        return True
+                elif rule_oid == '2.5.13.5':  # caseExactMatch
+                    if self._normalize_string_value(value) == assertion:
+                        return True
+                else:  # caseIgnoreMatch
+                    if self._normalize_string_value(value).lower() == assertion.lower():
+                        return True
+            except (TypeError, ValueError, UnicodeError, LDAPInvalidDnError):  # value cannot be evaluated with the rule
+                pass
+        return False
+
+    @staticmethod
+    def _normalize_string_value(value):
+        """Removes insignificant spaces as per RFC 4518"""
+        return ' '.join(to_unicode(value, SERVER_ENCODING).split())
+
+    @staticmethod
+    def _dn_to_rdns(dn):
+        """Parses a dn into a list of rdns, each rdn is a list of (attribute type, attribute value) tuples"""
+        rdns = []
+        avas = []
+        for attribute_type, attribute_value, separator in parse_dn(dn, escape=True, strip=True):
+            avas.append((attribute_type, attribute_value))
+            if separator != '+':
+                rdns.append(avas)
+                avas = []
+        if avas:
+            rdns.append(avas)
+        return rdns
+
+    def _rdns_equal(self, rdns1, rdns2, schema):
+        if len(rdns1) != len(rdns2):
+            return False
+        for avas1, avas2 in zip(rdns1, rdns2):
+            if len(avas1) != len(avas2):
+                return False
+            remaining = list(avas2)
+            for attribute_type1, attribute_value1 in avas1:
+                for i, (attribute_type2, attribute_value2) in enumerate(remaining):
+                    if self._same_attribute_type(attribute_type1, attribute_type2, schema) and \
+                            self._normalize_string_value(self._unescape_dn_value(attribute_value1)).lower() == self._normalize_string_value(self._unescape_dn_value(attribute_value2)).lower():
+                        del remaining[i]
+                        break
+                else:
+                    return False
+        return True
+
+    def _same_attribute_type(self, attribute_type1, attribute_type2, schema):
+        return self._attribute_type_key(attribute_type1, schema) == self._attribute_type_key(attribute_type2, schema)
+
+    @staticmethod
+    def _attribute_type_key(attribute_type, schema):
+        if schema is not None and schema.attribute_types:
+            try:
+                oid = schema.attribute_types[attribute_type].oid
+                if oid:
+                    return oid
+            except KeyError:
+                pass
+        return attribute_type.strip().lower()
+
+    @staticmethod
+    def _unescape_dn_value(value):
+        unescaped = bytearray()
+        pos = 0
+        while pos < len(value):
+            if value[pos] == '\\' and pos + 1 < len(value):
+                if pos + 2 < len(value) and value[pos + 1] in hexdigits and value[pos + 2] in hexdigits:
+                    unescaped.append(int(value[pos + 1:pos + 3], 16))
+                    pos += 3
+                else:
+                    unescaped.extend(to_raw(value[pos + 1]))
+                    pos += 2
+            else:
+                unescaped.extend(to_raw(value[pos]))
+                pos += 1
+        return to_unicode(bytes(unescaped), SERVER_ENCODING)
 
     def equal(self, dn, attribute_type, value_to_check):
         # value is the value to match
@@ -924,4 +1203,3 @@ class MockBaseStrategy(object):
             if log_enabled(ERROR):
                 log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
             raise LDAPSocketOpenError(self.connection.last_error)
-

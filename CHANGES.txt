@@ -2,6 +2,7 @@
     - fixed IndexError in auto_range search when response has no ranged attributes
     - fixed TypeError in format_ad_timedelta with malformed AD timestamps
     - Allow empty base for mocks
+    - added extensible match (matchingRule) support to MOCK_SYNC and MOCK_ASYNC strategies, evaluated against the server schema (caseIgnoreMatch, caseExactMatch, integerMatch, distinguishedNameMatch, dnAttributes and omitted attribute type)
 
 # 2.10.2rc3 . 2025.04.19
     - tested against Python 3.13
