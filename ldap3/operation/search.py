@@ -455,7 +455,16 @@ def checked_attributes_to_dict_fast(attribute_list, schema=None, custom_formatte
 
 
 def matching_rule_assertion_to_string(matching_rule_assertion):
-    return str(matching_rule_assertion)
+    filter_string = ''
+    if matching_rule_assertion['type'].hasValue():
+        filter_string += str(matching_rule_assertion['type'])
+    filter_string += ':'
+    if matching_rule_assertion['dnAttributes'].hasValue() and matching_rule_assertion['dnAttributes']:
+        filter_string += 'dn:'
+    if matching_rule_assertion['matchingRule'].hasValue():
+        filter_string += str(matching_rule_assertion['matchingRule']) + ':'
+    filter_string += '=' + str(matching_rule_assertion['matchValue'])  # the match value is already escaped for use in a filter
+    return filter_string
 
 
 def filter_to_string(filter_object):

@@ -39,8 +39,14 @@ Then you can use the mock connection as a normal connection to an LDAP server.
     (either single or multi-valued). The password must be stored as cleartext. You cannot use the ``auto_bind`` parameter because the DIT is
     populated after the creation of the Connection object.
 
-MockBaseStrategy supports the Bind, Unbind, Add, Modify, ModifyDn, Compare, Delete and Search operations (except for the
-extensible match). Abandon and Extended are not supported.
+MockBaseStrategy supports the Bind, Unbind, Add, Modify, ModifyDn, Compare, Delete and Search operations. Abandon and Extended are not supported.
+
+.. note::
+    Extensible match filters (``:=``) are evaluated locally by the Mock strategies: the matching rule is resolved against the
+    server schema (by OID or name) and the *caseIgnoreMatch*, *caseExactMatch*, *integerMatch* and *distinguishedNameMatch* rules
+    are supported out of the box. Additional rules can be registered with the ``register_matching_rule()`` classmethod of
+    MockBaseStrategy. Filters are evaluated with the three-valued logic of RFC 4511: unknown rules, not applicable attributes
+    and values that cannot be prepared evaluate to Undefined and never match, even under a NOT filter.
 
 .. note::
     You can replicate the DIT of a real server (or just the portions of the Tree that you need in your tests) using the ``response_to_file()`` method

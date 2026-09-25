@@ -42,12 +42,12 @@ from ..operation.search import search_request_to_dict, parse_filter, ROOT, AND, 
     MATCH_GREATER_OR_EQUAL, MATCH_LESS_OR_EQUAL, MATCH_EXTENSIBLE, MATCH_PRESENT,\
     MATCH_SUBSTRING, MATCH_EQUAL
 from ..utils.conv import json_hook, to_unicode, to_raw
-from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
+from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError, LDAPInvalidDnError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
     RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
 from ..utils.ciDict import CaseInsensitiveDict
-from ..utils.dn import to_dn, safe_dn, safe_rdn
+from ..utils.dn import to_dn, safe_dn, safe_rdn, parse_dn
 from ..protocol.sasl.sasl import validate_simple_password
 from ..protocol.formatters.standard import find_attribute_validator, format_attribute_values
 from ..protocol.rfc2696 import paged_search_control
@@ -154,10 +154,117 @@ class PagedSearchSet(object):
         return response, result
 
 
+def _prepare_string_for_match(value, case_sensitive):
+    # prepares a string value as per RFC 4518 section 2.6.1: insignificant spaces are removed, case is optionally ignored
+    prepared = ' '.join(to_unicode(value, SERVER_ENCODING).split())
+    return prepared if case_sensitive else prepared.lower()
+
+
+def _case_ignore_match(assertion_value, attribute_value):
+    try:
+        return _prepare_string_for_match(assertion_value, False) == _prepare_string_for_match(attribute_value, False)
+    except UnicodeError:
+        return None  # value cannot be prepared, evaluation is Undefined
+
+
+def _case_exact_match(assertion_value, attribute_value):
+    try:
+        return _prepare_string_for_match(assertion_value, True) == _prepare_string_for_match(attribute_value, True)
+    except UnicodeError:
+        return None  # value cannot be prepared, evaluation is Undefined
+
+
+def _prepare_integer_for_match(value):
+    try:
+        return int(to_unicode(value, SERVER_ENCODING).strip())
+    except (TypeError, ValueError, UnicodeError):
+        return None
+
+
+def _integer_match(assertion_value, attribute_value):
+    prepared_assertion = _prepare_integer_for_match(assertion_value)
+    prepared_value = _prepare_integer_for_match(attribute_value)
+    if prepared_assertion is None or prepared_value is None:
+        return None  # value cannot be prepared, evaluation is Undefined
+    return prepared_assertion == prepared_value
+
+
+def _unescape_dn_value(value):
+    # unescapes a DN attribute value as per RFC 4514 (\\XX hex pairs and \\<special> escapes)
+    if '\\' not in value:
+        return value
+    unescaped = bytearray()
+    pos = 0
+    while pos < len(value):
+        if value[pos] == '\\' and pos + 1 < len(value):
+            if pos + 2 < len(value) and value[pos + 1] in '0123456789abcdefABCDEF' and value[pos + 2] in '0123456789abcdefABCDEF':
+                unescaped.append(int(value[pos + 1:pos + 3], 16))
+                pos += 3
+            else:
+                unescaped.extend(value[pos + 1].encode('utf-8'))
+                pos += 2
+        else:
+            unescaped.extend(value[pos].encode('utf-8'))
+            pos += 1
+    try:
+        return unescaped.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+
+
+def _normalize_dn_for_match(value):
+    # returns a tuple of frozensets, one for each RDN; every frozenset holds the (type, value) pairs of a possibly multi-valued RDN
+    try:
+        rdns = parse_dn(to_unicode(value, SERVER_ENCODING), escape=False, strip=True)
+    except (LDAPInvalidDnError, UnicodeError):
+        return None
+    normalized_rdns = []
+    current_rdn = []
+    for attribute_type, attribute_value, separator in rdns:
+        unescaped_value = _unescape_dn_value(attribute_value)
+        if unescaped_value is None:
+            return None
+        current_rdn.append((attribute_type.lower(), _prepare_string_for_match(unescaped_value, False)))
+        if separator != '+':
+            normalized_rdns.append(frozenset(current_rdn))
+            current_rdn = []
+    return tuple(normalized_rdns)
+
+
+def _distinguished_name_match(assertion_value, attribute_value):
+    normalized_assertion = _normalize_dn_for_match(assertion_value)
+    normalized_value = _normalize_dn_for_match(attribute_value)
+    if normalized_assertion is None or normalized_value is None:
+        return None  # value cannot be prepared, evaluation is Undefined
+    return normalized_assertion == normalized_value
+
+
 class MockBaseStrategy(object):
     """
     Base class for connection strategy
     """
+
+    # evaluators for the matching rules usable in extensibleMatch filters, keyed by lowercase rule name or OID;
+    # an evaluator receives the assertion value and a stored value and returns True, False or None (Undefined)
+    extensible_match_evaluators = {
+        '2.5.13.1': _distinguished_name_match,
+        'distinguishednamematch': _distinguished_name_match,
+        '2.5.13.2': _case_ignore_match,
+        'caseignorematch': _case_ignore_match,
+        '2.5.13.5': _case_exact_match,
+        'caseexactmatch': _case_exact_match,
+        '2.5.13.14': _integer_match,
+        'integermatch': _integer_match,
+    }
+
+    @classmethod
+    def register_matching_rule(cls, names, evaluator):
+        """Registers an evaluator for one or more matching rule names/OIDs, so that additional
+        rules can be used in extensibleMatch filters evaluated by the Mock strategies"""
+        if isinstance(names, str):
+            names = [names]
+        for name in names:
+            cls.extensible_match_evaluators[name.strip().lower()] = evaluator
 
     def __init__(self):
         if not hasattr(self.connection.server, 'dit'):  # create entries dict if not already present
@@ -788,11 +895,15 @@ class MockBaseStrategy(object):
 
             for element in node.elements[1:]:
                 node.matched.intersection_update(element.matched)
-                node.unmatched.intersection_update(element.unmatched)
+                node.unmatched.update(element.unmatched)  # three-valued logic: AND is FALSE when any element is FALSE
         elif node.tag == OR:
-            for element in node.elements:
+            first_element = node.elements[0]
+            node.matched.update(first_element.matched)
+            node.unmatched.update(first_element.unmatched)
+
+            for element in node.elements[1:]:
                 node.matched.update(element.matched)
-                node.unmatched.update(element.unmatched)
+                node.unmatched.intersection_update(element.unmatched)  # three-valued logic: OR is FALSE only when all elements are FALSE
         elif node.tag == NOT:
             node.matched = node.elements[0].unmatched
             node.unmatched = node.elements[0].matched
@@ -829,10 +940,7 @@ class MockBaseStrategy(object):
                             else:
                                 node.unmatched.add(candidate)
         elif node.tag == MATCH_EXTENSIBLE:
-            self.connection.last_error = 'Extensible match not allowed in Mock strategy'
-            if log_enabled(ERROR):
-                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-            raise LDAPDefinitionError(self.connection.last_error)
+            self._evaluate_extensible_match(node, candidates)
         elif node.tag == MATCH_PRESENT:
             attr_name = node.assertion['attr']
             for candidate in candidates:
@@ -876,6 +984,105 @@ class MockBaseStrategy(object):
                     node.matched.add(candidate)
                 else:
                     node.unmatched.add(candidate)
+
+    def _evaluate_extensible_match(self, node, candidates):
+        """Evaluates an extensibleMatch filter against the mock DIT, following the three-valued
+        logic of RFC 4511: every candidate ends up in node.matched (TRUE), in node.unmatched
+        (FALSE) or in neither set (Undefined)"""
+        attr_name = node.assertion['attr']
+        matching_rule = node.assertion['matchingRule']
+        dn_attributes = node.assertion['dnAttributes']
+        assertion_value = ldap_escape_to_bytes(node.assertion['value'])
+
+        evaluator, applicable_attributes = self._resolve_matching_rule(matching_rule, attr_name)
+        if evaluator is None:  # unknown matching rule or rule not applicable to the attribute, Undefined for all candidates
+            return
+
+        for candidate in candidates:
+            entry = self.connection.server.dit[candidate]
+            outcomes = []
+            if attr_name:
+                attribute_names = [attr_name]
+            elif applicable_attributes is not None:
+                attribute_names = [attribute for attribute in entry if attribute.lower() in applicable_attributes]
+            else:
+                attribute_names = list(entry)
+            for attribute_name in attribute_names:
+                if attribute_name in entry:
+                    attribute_values = entry[attribute_name]
+                    if not isinstance(attribute_values, SEQUENCE_TYPES):
+                        attribute_values = [attribute_values]
+                    for attribute_value in attribute_values:
+                        outcomes.append(evaluator(assertion_value, attribute_value))
+            if dn_attributes:  # the match is also applied to the attributes of the entry DN
+                for _, dn_value in self._dn_attribute_values(candidate):
+                    outcomes.append(evaluator(assertion_value, dn_value))
+            if any(outcome is True for outcome in outcomes):
+                node.matched.add(candidate)
+            elif any(outcome is False for outcome in outcomes):
+                node.unmatched.add(candidate)
+            # else the evaluation is Undefined and the candidate is in neither set
+
+    def _resolve_matching_rule(self, matching_rule, attr_name):
+        """Resolves a matching rule name/OID against the server schema; returns the evaluator and the
+        set of attributes the rule applies to (None when unrestricted). Returns (None, None) when the
+        rule is unknown or not applicable to the attribute, so the filter evaluates to Undefined"""
+        schema = self.connection.server.schema
+        applicable_attributes = None
+        if not matching_rule:  # no rule specified, the EQUALITY rule of the attribute is used (RFC 4511 section 4.5.1.7)
+            matching_rule = self._find_attribute_equality_rule(attr_name, schema) or 'caseIgnoreMatch'
+        rule_names = [matching_rule]
+        if schema and schema.matching_rules and matching_rule in schema.matching_rules:
+            rule_info = schema.matching_rules[matching_rule]
+            rule_names = ([rule_info.oid] if rule_info.oid else []) + list(rule_info.name or [])
+            if schema.matching_rule_uses and rule_info.oid in schema.matching_rule_uses and schema.matching_rule_uses[rule_info.oid].apply_to:
+                applicable_attributes = set(attribute.lower() for attribute in schema.matching_rule_uses[rule_info.oid].apply_to)
+        elif schema and schema.matching_rule_uses and matching_rule in schema.matching_rule_uses and schema.matching_rule_uses[matching_rule].apply_to:
+            applicable_attributes = set(attribute.lower() for attribute in schema.matching_rule_uses[matching_rule].apply_to)
+        evaluator = None
+        for rule_name in rule_names:
+            evaluator = self.extensible_match_evaluators.get(str(rule_name).lower())
+            if evaluator is not None:
+                break
+        if evaluator is None:  # unknown matching rule
+            return None, None
+        if attr_name and applicable_attributes is not None and attr_name.lower() not in applicable_attributes:
+            return None, None  # matching rule not applicable to the attribute
+        return evaluator, applicable_attributes
+
+    @staticmethod
+    def _find_attribute_equality_rule(attr_name, schema):
+        # walks up the attribute type hierarchy looking for the EQUALITY matching rule
+        if not attr_name or not schema or not schema.attribute_types:
+            return None
+        attribute_name = attr_name
+        inspected = set()
+        while attribute_name and attribute_name.lower() not in inspected:
+            inspected.add(attribute_name.lower())
+            if attribute_name not in schema.attribute_types:
+                return None
+            attribute_info = schema.attribute_types[attribute_name]
+            if attribute_info.equality:
+                equality = attribute_info.equality
+                return equality[0] if isinstance(equality, SEQUENCE_TYPES) else equality
+            superior = attribute_info.superior
+            attribute_name = superior[0] if isinstance(superior, SEQUENCE_TYPES) and superior else superior
+        return None
+
+    @staticmethod
+    def _dn_attribute_values(dn):
+        """Returns the (attribute_type, unescaped value) pairs of all the AVAs in a DN,
+        including the components of multi-valued RDNs"""
+        try:
+            rdns = parse_dn(to_unicode(dn, SERVER_ENCODING), escape=False, strip=True)
+        except (LDAPInvalidDnError, UnicodeError):
+            return []
+        avas = []
+        for attribute_type, attribute_value, _ in rdns:
+            unescaped_value = _unescape_dn_value(attribute_value)
+            if unescaped_value is not None:
+                avas.append((attribute_type, unescaped_value))
+        return avas
 
     def equal(self, dn, attribute_type, value_to_check):
         # value is the value to match
@@ -924,4 +1131,3 @@ class MockBaseStrategy(object):
             if log_enabled(ERROR):
                 log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
             raise LDAPSocketOpenError(self.connection.last_error)
-
