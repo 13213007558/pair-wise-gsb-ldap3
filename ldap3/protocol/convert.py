@@ -165,7 +165,7 @@ def validate_attribute_value(schema, name, value, auto_encode, validator=None, c
     conf_attributes_excluded_from_check = [v.lower() for v in get_config_parameter('ATTRIBUTES_EXCLUDED_FROM_CHECK')]
     conf_utf8_syntaxes = get_config_parameter('UTF8_ENCODED_SYNTAXES')
     conf_utf8_types = [v.lower() for v in get_config_parameter('UTF8_ENCODED_TYPES')]
-    if schema and schema.attribute_types:
+    if schema and schema.attribute_types and name:
         if ';' in name:
             name = name.split(';')[0]
         if check_names and schema.object_classes and name.lower() == 'objectclass':

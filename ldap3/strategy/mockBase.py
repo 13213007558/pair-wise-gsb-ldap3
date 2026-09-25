@@ -42,12 +42,13 @@ from ..operation.search import search_request_to_dict, parse_filter, ROOT, AND, 
     MATCH_GREATER_OR_EQUAL, MATCH_LESS_OR_EQUAL, MATCH_EXTENSIBLE, MATCH_PRESENT,\
     MATCH_SUBSTRING, MATCH_EQUAL
 from ..utils.conv import json_hook, to_unicode, to_raw
-from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
+from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError, LDAPInvalidDnError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
-    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
+    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN, \
+    RESULT_INAPPROPRIATE_MATCHING
 from ..utils.ciDict import CaseInsensitiveDict
-from ..utils.dn import to_dn, safe_dn, safe_rdn
+from ..utils.dn import to_dn, safe_dn, safe_rdn, parse_dn
 from ..protocol.sasl.sasl import validate_simple_password
 from ..protocol.formatters.standard import find_attribute_validator, format_attribute_values
 from ..protocol.rfc2696 import paged_search_control
@@ -117,6 +118,19 @@ from ..protocol.convert import build_controls_list
 SEARCH_CONTROLS = ['1.2.840.113556.1.4.319'  # simple paged search [RFC 2696]
                    ]
 SERVER_ENCODING = 'utf-8'
+
+# standard matching rules the mock DSA is able to evaluate in extensible match filters,
+# as per RFC 4512 and RFC 4517: oid -> (name, assertion syntax oid)
+MOCK_STANDARD_MATCHING_RULES = {
+    '2.5.13.1': ('distinguishedNameMatch', '1.3.6.1.4.1.1466.115.121.1.12'),
+    '2.5.13.2': ('caseIgnoreMatch', '1.3.6.1.4.1.1466.115.121.1.15'),
+    '2.5.13.5': ('caseExactMatch', '1.3.6.1.4.1.1466.115.121.1.15'),
+    '2.5.13.14': ('integerMatch', '1.3.6.1.4.1.1466.115.121.1.27'),
+}
+
+
+class MockInappropriateMatchingError(Exception):
+    """raised when an extensible match filter cannot be evaluated by the mock DSA, converted to an inappropriateMatching result"""
 
 
 def random_cookie():
@@ -694,29 +708,35 @@ class MockBaseStrategy(object):
             result_code = RESULT_NO_SUCH_OBJECT
             message = 'incorrect base object'
         else:
-            matched = self.evaluate_filter_node(filter_root, candidates)
-            if self.connection.raise_exceptions and 0 < request['sizeLimit'] < len(matched):
-                result_code = 4
-                message = 'size limit exceeded'
-            else:
-                for match in matched:
-                    responses.append({
-                        'object': match,
-                        'attributes': [{'type': attribute,
-                                        'vals': [] if request['typesOnly'] else self.connection.server.dit[match][attribute]}
-                                       for attribute in self.connection.server.dit[match]
-                                       if attribute.lower() in attributes or ALL_ATTRIBUTES in attributes]
-                    })
-                    if '+' not in attributes:  # remove operational attributes
-                        for op_attr in self.operational_attributes:
-                            if op_attr.lower() in attributes:
-                                # if the op_attr was explicitly requested, then keep it
-                                continue
-                            for i, attr in enumerate(responses[len(responses)-1]['attributes']):
-                                if attr['type'] == op_attr:
-                                    del responses[len(responses)-1]['attributes'][i]
-                result_code = 0
-                message = ''
+            try:
+                matched = self.evaluate_filter_node(filter_root, candidates)
+            except MockInappropriateMatchingError as e:  # extensible match filter not evaluable, returned as per RFC 4511
+                matched = None
+                result_code = RESULT_INAPPROPRIATE_MATCHING
+                message = str(e)
+            if matched is not None:
+                if self.connection.raise_exceptions and 0 < request['sizeLimit'] < len(matched):
+                    result_code = 4
+                    message = 'size limit exceeded'
+                else:
+                    for match in matched:
+                        responses.append({
+                            'object': match,
+                            'attributes': [{'type': attribute,
+                                            'vals': [] if request['typesOnly'] else self.connection.server.dit[match][attribute]}
+                                           for attribute in self.connection.server.dit[match]
+                                           if attribute.lower() in attributes or ALL_ATTRIBUTES in attributes]
+                        })
+                        if '+' not in attributes:  # remove operational attributes
+                            for op_attr in self.operational_attributes:
+                                if op_attr.lower() in attributes:
+                                    # if the op_attr was explicitly requested, then keep it
+                                    continue
+                                for i, attr in enumerate(responses[len(responses)-1]['attributes']):
+                                    if attr['type'] == op_attr:
+                                        del responses[len(responses)-1]['attributes'][i]
+                    result_code = 0
+                    message = ''
 
         result = {'resultCode': result_code,
                   'matchedDN': '',
@@ -829,10 +849,7 @@ class MockBaseStrategy(object):
                             else:
                                 node.unmatched.add(candidate)
         elif node.tag == MATCH_EXTENSIBLE:
-            self.connection.last_error = 'Extensible match not allowed in Mock strategy'
-            if log_enabled(ERROR):
-                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-            raise LDAPDefinitionError(self.connection.last_error)
+            self._evaluate_extensible_match(node, candidates)
         elif node.tag == MATCH_PRESENT:
             attr_name = node.assertion['attr']
             for candidate in candidates:
@@ -876,6 +893,185 @@ class MockBaseStrategy(object):
                     node.matched.add(candidate)
                 else:
                     node.unmatched.add(candidate)
+
+    def _evaluate_extensible_match(self, node, candidates):
+        """Evaluates an extensible match filter as per RFC 4511 4.5.1.7.4, interpreting
+        the matching rule against the server schema. Rules that cannot be recognized or
+        evaluated raise MockInappropriateMatchingError, converted to an inappropriateMatching
+        result by the caller; rules not applicable to an attribute make the filter item
+        undefined for that attribute (no match), never a fallback to plain string equality."""
+        attr_name = node.assertion['attr']  # False when the attribute type is omitted
+        matching_rule = node.assertion['matchingRule']  # False when the matching rule is omitted
+        dn_attributes = node.assertion['dnAttributes']
+        assertion_value = ldap_escape_to_bytes(node.assertion['value'])  # assertion values are stored in filter-escaped form
+
+        rule_oid, rule_syntax = self._extensible_match_rule(matching_rule, attr_name)
+        if rule_oid is None:  # no equality matching rule available, the filter item is undefined
+            node.unmatched.update(candidates)
+            return
+        comparator = self._extensible_match_comparator(rule_oid)
+        if comparator is None:
+            raise MockInappropriateMatchingError('matching rule ' + str(matching_rule or rule_oid) + ' not supported by the Mock strategy')
+
+        for candidate in candidates:
+            entry = self.connection.server.dit[candidate]
+            matched = False
+            if attr_name:  # match against the named attribute, aliases included
+                attribute_names = [attribute for attribute in entry if self._same_attribute_type(attribute, attr_name)]
+            else:  # match against every attribute the rule is applicable to
+                attribute_names = [attribute for attribute in entry if self._extensible_match_applicable(rule_syntax, attribute)]
+            for attribute in attribute_names:
+                if attr_name and not self._extensible_match_applicable(rule_syntax, attribute):
+                    continue  # rule not applicable to the named attribute, the filter item is undefined
+                for value in entry[attribute]:
+                    if comparator(value, assertion_value):
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched and dn_attributes:  # match against the attributes of the entry DN
+                for rdn_attribute, rdn_value in self._dn_attributes(candidate):
+                    if attr_name and not self._same_attribute_type(rdn_attribute, attr_name):
+                        continue
+                    if not self._extensible_match_applicable(rule_syntax, rdn_attribute):
+                        continue
+                    if comparator(to_raw(rdn_value), assertion_value):
+                        matched = True
+                        break
+            if matched:
+                node.matched.add(candidate)
+            else:
+                node.unmatched.add(candidate)
+
+    def _extensible_match_rule(self, matching_rule, attr_name):
+        """Resolves the matching rule of an extensible match filter against the server schema,
+        falling back to the standard rules the mock DSA is able to evaluate. Returns a
+        (rule_oid, rule_syntax) tuple, (None, None) when the filter item is undefined.
+        Raises MockInappropriateMatchingError when the requested rule is not recognized."""
+        schema = self.connection.server.schema
+        if not matching_rule:  # the equality matching rule of the attribute is used, as per RFC 4511 4.5.1.7.4
+            equality = self._schema_attribute_property(attr_name, 'equality')
+            if equality:
+                matching_rule = equality[0]
+            elif self._schema_attribute_info(attr_name) is not None:
+                return None, None  # the attribute has no equality matching rule, the filter item is undefined
+            else:
+                matching_rule = 'caseIgnoreMatch'  # no schema information available, defaults to the mock equality behaviour
+        if schema and schema.matching_rules and matching_rule in schema.matching_rules:
+            rule_info = schema.matching_rules[matching_rule]
+            return rule_info.oid, rule_info.syntax
+        for rule_oid, (rule_name, rule_syntax) in MOCK_STANDARD_MATCHING_RULES.items():
+            if matching_rule == rule_oid or matching_rule.lower() == rule_name.lower():
+                return rule_oid, rule_syntax
+        raise MockInappropriateMatchingError('unrecognized matching rule ' + str(matching_rule))
+
+    def _extensible_match_comparator(self, rule_oid):
+        comparators = {
+            '2.5.13.1': self._compare_distinguished_name,
+            '2.5.13.2': self._compare_case_ignore,
+            '2.5.13.5': self._compare_case_exact,
+            '2.5.13.14': self._compare_integer,
+        }
+        return comparators.get(rule_oid)
+
+    def _extensible_match_applicable(self, rule_syntax, attr_name):
+        """A matching rule is applicable to an attribute when the attribute syntax,
+        possibly inherited from its superior types, matches the rule assertion syntax."""
+        if not rule_syntax:
+            return True
+        attribute_syntax = self._schema_attribute_property(attr_name, 'syntax')
+        if not attribute_syntax:
+            return True  # no syntax information available, the rule is assumed applicable
+        return attribute_syntax.split('{')[0] == rule_syntax.split('{')[0]
+
+    def _schema_attribute_info(self, attr_name):
+        schema = self.connection.server.schema
+        if schema and schema.attribute_types and attr_name and attr_name in schema.attribute_types:
+            return schema.attribute_types[attr_name]
+        return None
+
+    def _schema_attribute_property(self, attr_name, property_name):
+        """Walks up the attribute type hierarchy to find an inherited schema property"""
+        visited = set()
+        attribute_info = self._schema_attribute_info(attr_name)
+        while attribute_info is not None:
+            property_value = getattr(attribute_info, property_name, None)
+            if property_value:
+                return property_value
+            if not attribute_info.superior:
+                return None
+            superior = attribute_info.superior[0]
+            if superior.lower() in visited:
+                return None
+            visited.add(superior.lower())
+            attribute_info = self._schema_attribute_info(superior)
+        return None
+
+    def _same_attribute_type(self, attr_name1, attr_name2):
+        """Compares two attribute names, resolving aliases through the server schema"""
+        if attr_name1.lower() == attr_name2.lower():
+            return True
+        info1 = self._schema_attribute_info(attr_name1)
+        info2 = self._schema_attribute_info(attr_name2)
+        return info1 is not None and info2 is not None and info1.oid == info2.oid
+
+    @staticmethod
+    def _dn_attributes(dn):
+        try:
+            return [(attribute, value) for attribute, value, separator in parse_dn(dn, escape=False, strip=True)]
+        except LDAPInvalidDnError:
+            return []
+
+    @staticmethod
+    def _compare_case_ignore(value1, value2):
+        try:
+            return to_unicode(value1, SERVER_ENCODING).lower() == to_unicode(value2, SERVER_ENCODING).lower()
+        except UnicodeError:
+            return False
+
+    @staticmethod
+    def _compare_case_exact(value1, value2):
+        if value1 == value2:
+            return True
+        try:
+            return to_unicode(value1, SERVER_ENCODING) == to_unicode(value2, SERVER_ENCODING)
+        except UnicodeError:
+            return False
+
+    @staticmethod
+    def _compare_integer(value1, value2):
+        try:
+            return int(to_unicode(value1, SERVER_ENCODING).strip()) == int(to_unicode(value2, SERVER_ENCODING).strip())
+        except (ValueError, UnicodeError):
+            return False
+
+    @staticmethod
+    def _compare_distinguished_name(value1, value2):
+        try:
+            rdns1 = MockBaseStrategy._decompose_dn(to_unicode(value1, SERVER_ENCODING))
+            rdns2 = MockBaseStrategy._decompose_dn(to_unicode(value2, SERVER_ENCODING))
+        except (LDAPInvalidDnError, UnicodeError):
+            return False
+        if not rdns1 or not rdns2 or len(rdns1) != len(rdns2):
+            return False
+        for avas1, avas2 in zip(rdns1, rdns2):
+            if len(avas1) != len(avas2):
+                return False
+            for ava in avas1:
+                if ava not in avas2:
+                    return False
+        return True
+
+    @staticmethod
+    def _decompose_dn(dn_string):
+        rdns = []
+        avas = []
+        for attribute, value, separator in parse_dn(dn_string, escape=False, strip=True):
+            avas.append((attribute.lower(), value.lower()))
+            if separator != '+':
+                rdns.append(avas)
+                avas = []
+        return rdns
 
     def equal(self, dn, attribute_type, value_to_check):
         # value is the value to match

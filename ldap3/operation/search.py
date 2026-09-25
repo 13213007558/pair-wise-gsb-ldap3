@@ -455,7 +455,23 @@ def checked_attributes_to_dict_fast(attribute_list, schema=None, custom_formatte
 
 
 def matching_rule_assertion_to_string(matching_rule_assertion):
-    return str(matching_rule_assertion)
+    filter_string = ''
+    attribute_type = matching_rule_assertion['type']
+    if attribute_type is not None and attribute_type.isValue:
+        filter_string += str(attribute_type)
+    dn_attributes = matching_rule_assertion['dnAttributes']
+    if dn_attributes is not None and dn_attributes.isValue and bool(dn_attributes):
+        filter_string += ':dn'
+    matching_rule = matching_rule_assertion['matchingRule']
+    if matching_rule is not None and matching_rule.isValue:
+        filter_string += ':' + str(matching_rule)
+    filter_string += ':='
+    match_value = matching_rule_assertion['matchValue']
+    try:
+        filter_string += str(match_value)  # the value is already in filter-escaped form
+    except Exception:  # invalid encoding, return bytes value
+        filter_string += str(bytes(match_value))
+    return filter_string
 
 
 def filter_to_string(filter_object):
