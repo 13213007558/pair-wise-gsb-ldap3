@@ -154,3 +154,5 @@ from .abstract.attribute import Attribute, WritableAttribute, OperationalAttribu
 from .abstract.entry import Entry, WritableEntry
 from .abstract.cursor import Reader, Writer
 from .protocol.rfc4512 import DsaInfo, SchemaInfo
+from .protocol.entryValidator import EntryValidationIssue, EntryValidationResult, SEVERITY_UNDETERMINED, \
+    SEVERITY_VIOLATION, schema_from_definitions, validate_entry
