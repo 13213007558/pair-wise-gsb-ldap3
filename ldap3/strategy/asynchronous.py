@@ -176,6 +176,12 @@ class AsyncStrategy(BaseStrategy):
                     else:  # Unsolicited Notification
                         if dict_response['responseName'] == '1.3.6.1.4.1.1466.20036':  # Notice of Disconnection as per RFC4511 (paragraph 4.4.1)
                             listen = False
+                        elif dict_response['responseName'] == '1.3.6.1.1.21.4':  # Aborted Transaction Notice as per RFC5805 (paragraph 3.4)
+                            if self.connection._rfc5805_transaction is not None:
+                                self.connection._rfc5805_transaction._notify_aborted()
+                            unprocessed = unprocessed[length:]
+                            get_more_data = False if unprocessed else True
+                            listen = True if self.connection.listening or unprocessed else False
                         else:
                             self.connection.last_error = 'unknown unsolicited notification from server'
                             if log_enabled(ERROR):

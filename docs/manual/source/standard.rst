@@ -3,7 +3,7 @@ Extended standard RFCs operations
 
 The extend.standard namespace contains extended operation defined in current RFCs::
 
-    extend.standard
+        extend.standard
         extend.standard.who_am_i()
         extend.standard.modify_password(
             user,
@@ -42,6 +42,13 @@ The extend.standard namespace contains extended operation defined in current RFC
             streaming,
             callback
         )
+        extend.standard.start_transaction(controls=None)
+        extend.standard.end_transaction(
+            transaction_id,
+            commit=True,
+            controls=None
+        )
+        extend.standard.transaction(controls=None)
 
 To get the identity of the bound user::
 
@@ -218,3 +225,37 @@ When using next(block=False) or next(block=True, timeout=10) the method returns 
 If you call the persistent_search() method with **callback=myfunction** (where myfunction is a callable, including lambda,
 accepting a dict as parameter) your function will be called for each event received in the persistent serach.
 The function will be called in the same thread of the persistent search, so it should not block.
+
+LDAP Transactions (RFC5805)
+---------------------------
+
+If the server supports RFC5805 you can group multiple update operations in a single transaction. The
+extend.standard.transaction() method returns a context manager that starts the transaction and automatically
+aborts it if the with-block is exited with an exception and the transaction has not been committed yet::
+
+    from ldap3 import Server, Connection, MODIFY_REPLACE
+    s = Server(...)
+    c = Connection(s, ...)
+    c.bind()
+    with c.extend.standard.transaction() as transaction:
+        transaction.add('cn=user1,o=test', 'inetOrgPerson', {'sn': 'user1'})
+        transaction.modify('cn=user2,o=test', {'givenName': (MODIFY_REPLACE, ['user2'])})
+        transaction.delete('cn=user3,o=test')
+        transaction.modify_dn('cn=user4,o=test', 'cn=user4-renamed')
+        transaction.commit()  # or transaction.abort()
+
+The add(), modify(), delete() and modify_dn() methods of the transaction object attach the Transaction
+Specification Control (with the opaque transaction id returned by the Start Transaction extended operation)
+to each request. The control is never leaked to unrelated requests sent over the same connection.
+
+You can also manage the transaction explicitly with the lower level extend.standard.start_transaction() and
+extend.standard.end_transaction() extended operations, attaching the Transaction Specification Control
+(OID 1.3.6.1.1.21.2) by yourself.
+
+If the commit fails the server reports the messageID of the failed update request. The transaction object
+exposes it as transaction.failed_message_id and the matching operation description as
+transaction.failed_operation. The response controls returned with the End Transaction response
+(which may carry the per-operation response controls) are available in transaction.result['controls'].
+
+If the server aborts the transaction it sends an Aborted Transaction Notice: the transaction object is
+marked as aborted (transaction.aborted) and subsequent operations on it raise an LDAPTransactionError.

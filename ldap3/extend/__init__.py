@@ -48,6 +48,7 @@ from .standard.whoAmI import WhoAmI
 from .standard.modifyPassword import ModifyPassword
 from .standard.PagedSearch import paged_search_generator, paged_search_accumulator
 from .standard.PersistentSearch import PersistentSearch
+from .standard.transaction import Transaction, StartTransaction as StandardStartTransaction, EndTransaction as StandardEndTransaction
 
 
 class ExtendedOperationContainer(object):
@@ -65,6 +66,23 @@ class StandardExtendedOperations(ExtendedOperationContainer):
     def who_am_i(self, controls=None):
         return WhoAmI(self._connection,
                       controls).send()
+
+    def start_transaction(self, controls=None):
+        return StandardStartTransaction(self._connection,
+                                        controls).send()
+
+    def end_transaction(self,
+                        transaction_id,
+                        commit=True,
+                        controls=None):
+        return StandardEndTransaction(self._connection,
+                                      transaction_id,
+                                      commit,
+                                      controls).send()
+
+    def transaction(self, controls=None):
+        return Transaction(self._connection,
+                           controls)
 
     def modify_password(self,
                         user=None,

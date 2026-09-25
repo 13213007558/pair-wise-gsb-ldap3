@@ -334,6 +334,7 @@ class BaseStrategy(object):
                     log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
                 raise LDAPSASLBindInProgressError(self.connection.last_error)
             message_id = self.connection.server.next_message_id()
+            self.connection.last_message_id = message_id
             ldap_message = LDAPMessage()
             ldap_message['messageID'] = MessageID(message_id)
             ldap_message['protocolOp'] = ProtocolOp().setComponentByName(message_type, request)

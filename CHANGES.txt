@@ -1,4 +1,5 @@
 # 2.10.2rc4 . 2026.04.18
+    - added support for RFC5805 LDAP Transactions (extend.standard.transaction, start_transaction, end_transaction)
     - fixed IndexError in auto_range search when response has no ranged attributes
     - fixed TypeError in format_ad_timedelta with malformed AD timestamps
     - Allow empty base for mocks

@@ -235,6 +235,10 @@ class SyncStrategy(BaseStrategy):
                                 return SESSION_TERMINATED_BY_SERVER
                             elif dict_response['responseName'] == '2.16.840.1.113719.1.27.103.4':  # Novell LDAP transaction error unsolicited notification
                                 return TRANSACTION_ERROR
+                            elif dict_response['responseName'] == '1.3.6.1.1.21.4':  # Aborted Transaction Notice as per RFC5805 (paragraph 3.4)
+                                if self.connection._rfc5805_transaction is not None:
+                                    self.connection._rfc5805_transaction._notify_aborted()
+                                return TRANSACTION_ERROR
                             else:
                                 self.connection.last_error = 'unknown unsolicited notification from server'
                                 if log_enabled(ERROR):

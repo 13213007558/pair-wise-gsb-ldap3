@@ -255,6 +255,8 @@ class Connection(object):
             self.listening = False
             self.closed = True
             self.last_error = None
+            self.last_message_id = None
+            self._rfc5805_transaction = None  # active RFC5805 transaction, notified of Aborted Transaction Notices
             if auto_bind is False:  # compatibility with older version where auto_bind was a boolean
                 self.auto_bind = AUTO_BIND_DEFAULT
             elif auto_bind is True:
