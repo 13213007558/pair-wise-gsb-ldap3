@@ -482,6 +482,21 @@ class LDAPLDIFError(LDAPExceptionError):
     pass
 
 
+class LDAPLDIFParseError(LDAPLDIFError):
+    def __init__(self, message, line_number=None, record_number=None):
+        self.message = message
+        self.line_number = line_number
+        self.record_number = record_number
+        location = []
+        if line_number is not None:
+            location.append('physical line %d' % line_number)
+        if record_number is not None:
+            location.append('record %d' % record_number)
+        if location:
+            message = message + ' (' + ', '.join(location) + ')'
+        super(LDAPLDIFParseError, self).__init__(message)
+
+
 class LDAPSchemaError(LDAPExceptionError):
     pass
 

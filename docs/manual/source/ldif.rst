@@ -8,7 +8,8 @@ If the DN of the entry or an attribute value contains any unicode character the 
 ldap3 is compliant to the latest LDIF format (version: 1).
 
 ldap3 can stream the output of a search (LDIF-CONTENT) or of an operation (LDIF-CHANGE) to a file object.
-It cannot read a file with LDIF content because this is not defined in the LDAPv3 standard.
+It can also read LDIF-CHANGE records from a binary stream and return operation objects without executing them.
+It cannot read LDIF-CONTENT because this is not defined in the LDAPv3 standard.
 Each LDAP server has its own tools to import an LDIF-CONTENT or to perform LDIF-CHANGE.
 
 
@@ -140,6 +141,37 @@ If you just define a file object as stream you'll find the output in the file::
         c.delete('cn=test2, o=test')
 
 you will find the LDIF output in the output.ldif file.
+
+Reading LDIF-CHANGE records
+===========================
+Open the stream in binary mode and iterate the change records. A complete record is returned only after its
+terminating blank line (or the end of the stream) has been parsed successfully, so malformed records never emit
+half an operation::
+
+    from ldap3 import parse_ldif_change_records
+
+    with open('changes.ldif', 'rb') as ldif_file:
+        for change in parse_ldif_change_records(ldif_file):
+            print(change.change_type, change.dn)
+            # change.execute(connection)  # optional: let the caller decide
+
+The generator returns ``AddChangeRecord``, ``DeleteChangeRecord``, ``ModifyChangeRecord`` and
+``ModifyDNChangeRecord`` objects. Modify changes are kept as an ordered list of
+``(operation, attribute, values)`` tuples; ``changes_dict`` converts them to the dictionary expected by
+``Connection.modify``. Each object provides an ``execute(connection)`` convenience method.
+
+Folded lines are joined before base64 decoding, and base64 values are preserved as bytes. Parse errors are
+reported as ``LDAPLDIFParseError`` with physical line and record numbers. URL values (``attr:<url>``) are not
+fetched unless you provide a resolver; the resolver receives the URL and must return bytes::
+
+    def resolver(url):
+        return custom_storage.read(url)
+
+    records = parse_ldif_change_records(ldif_file, resolver=resolver)
+
+No network or file access is performed for URLs without a resolver. To parse streams that deliver one byte at a
+time (for example some socket wrappers), pass ``chunk_size=1``; the resulting records are identical to those read
+from a normal file.
 
 
 When producing LDIF-CONTENT you can pass an existing stream object to the response_to_ldif() method to add the LDIF output to the stream. If the stream is empty the ldif version header will be added.

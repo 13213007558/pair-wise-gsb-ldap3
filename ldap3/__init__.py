@@ -154,3 +154,18 @@ from .abstract.attribute import Attribute, WritableAttribute, OperationalAttribu
 from .abstract.entry import Entry, WritableEntry
 from .abstract.cursor import Reader, Writer
 from .protocol.rfc4512 import DsaInfo, SchemaInfo
+from .core.exceptions import LDAPLDIFParseError
+from .protocol.ldifChangeReader import (LDIFChangeRecordReader,
+                                        LDIFChangeRecord,
+                                        LDIFAddChangeRecord,
+                                        LDIFDeleteChangeRecord,
+                                        LDIFModifyChangeRecord,
+                                        LDIFModifyDNChangeRecord,
+                                        AddChangeRecord,
+                                        DeleteChangeRecord,
+                                        ModifyChangeRecord,
+                                        ModifyDNChangeRecord,
+                                        ModifyDnChangeRecord,
+                                        ModrdnChangeRecord,
+                                        parse_ldif_change_records,
+                                        read_ldif_change_records)
