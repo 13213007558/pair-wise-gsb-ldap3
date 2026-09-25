@@ -23,11 +23,12 @@
 # along with ldap3 in the COPYING and COPYING.LESSER files.
 # If not, see <http://www.gnu.org/licenses/>.
 
-from base64 import b64encode
+from base64 import b64encode, b64decode
+from binascii import Error as BinasciiError
 from datetime import datetime
 
 from .. import STRING_TYPES
-from ..core.exceptions import LDAPLDIFError, LDAPExtensionError
+from ..core.exceptions import LDAPLDIFError, LDAPLDIFParseError, LDAPExtensionError
 from ..protocol.persistentSearch import EntryChangeNotificationControl
 from ..utils.asn1 import decoder
 from ..utils.config import get_config_parameter
@@ -293,3 +294,312 @@ def persistent_search_response_to_ldif(change):
     ldif_lines += operation_to_ldif('searchResponse', [change])
 
     return ldif_lines[:-1]  # removes "total number of entries"
+
+
+# LDIF change records reader (RFC 2849), reverse of the *_to_ldif writers
+
+_LDIF_MODIFY_OPERATIONS = ('add', 'delete', 'replace', 'increment')
+
+
+def _iter_source_chunks(source):
+    if hasattr(source, 'readline'):
+        while True:
+            chunk = source.readline()
+            if not chunk:
+                return
+            yield chunk
+    else:
+        for chunk in source:
+            yield chunk
+
+
+def _iter_physical_lines(source, encoding):
+    # yields (line_number, line_text) tuples, line numbers are 1-based
+    # chunks are accumulated as bytes so that multi-byte characters split
+    # across chunk boundaries are decoded only after a full line is read
+    buffered = b''
+    line_number = 0
+    for chunk in _iter_source_chunks(source):
+        if not isinstance(chunk, bytes):
+            chunk = chunk.encode(encoding)
+        buffered += chunk
+        while True:
+            pos = buffered.find(b'\n')
+            if pos == -1:
+                break
+            raw_line = buffered[:pos]
+            buffered = buffered[pos + 1:]
+            line_number += 1
+            yield line_number, _decode_physical_line(raw_line, encoding, line_number)
+    if buffered:
+        line_number += 1
+        yield line_number, _decode_physical_line(buffered, encoding, line_number)
+
+
+def _decode_physical_line(raw_line, encoding, line_number):
+    if raw_line.endswith(b'\r'):
+        raw_line = raw_line[:-1]
+    try:
+        return str(raw_line, encoding=encoding)
+    except UnicodeDecodeError:
+        raise LDAPLDIFParseError('invalid ' + encoding + ' encoding in LDIF stream', line_number=line_number)
+
+
+def _iter_logical_lines(source, encoding):
+    # unfolds continuation lines (a single leading space) before any decoding,
+    # as per note 2 of RFC 2849; yields (line_number, line_text) tuples where
+    # line_number is the physical line the logical line starts at
+    pending_line = None
+    pending_number = None
+    for line_number, line in _iter_physical_lines(source, encoding):
+        if line.startswith(' '):
+            if pending_line is None:
+                raise LDAPLDIFParseError('continuation line without a previous line', line_number=line_number)
+            pending_line += line[1:]
+            continue
+        if pending_line is not None:
+            yield pending_number, pending_line
+        pending_number, pending_line = line_number, line
+    if pending_line is not None:
+        yield pending_number, pending_line
+
+
+def _decode_base64_value(encoded_value, line_number, record_number):
+    try:
+        return b64decode(encoded_value, validate=True)
+    except (BinasciiError, ValueError):
+        raise LDAPLDIFParseError('invalid base64 value in LDIF stream', line_number=line_number, record_number=record_number)
+
+
+def _resolve_url_value(url, url_resolver, line_number, record_number):
+    if url_resolver is None:
+        raise LDAPLDIFParseError('URL value requires a caller provided resolver: ' + url, line_number=line_number, record_number=record_number)
+    value = url_resolver(url)
+    if isinstance(value, STRING_TYPES):
+        value = bytearray(value, encoding='utf-8')
+    if not isinstance(value, (bytes, bytearray)):
+        raise LDAPLDIFParseError('URL resolver must return bytes or string for: ' + url, line_number=line_number, record_number=record_number)
+    return bytes(value)
+
+
+def _value_from_suffix(suffix, url_resolver, line_number, record_number):
+    # suffix starts with ':', handles plain, base64 (::) and URL (:<) values
+    if suffix.startswith('::'):
+        return _decode_base64_value(suffix[2:].lstrip(' '), line_number, record_number)
+    if suffix.startswith(':<'):
+        return _resolve_url_value(suffix[2:].lstrip(' '), url_resolver, line_number, record_number)
+    return suffix[1:].lstrip(' ')
+
+
+def _parse_value_spec(line, url_resolver, line_number, record_number):
+    # returns (descriptor, value); value is str for plain values, bytes for base64 and URL values
+    pos = line.find(':')
+    if pos <= 0:
+        raise LDAPLDIFParseError('invalid LDIF line, missing descriptor: ' + line, line_number=line_number, record_number=record_number)
+    return line[:pos], _value_from_suffix(line[pos:], url_resolver, line_number, record_number)
+
+
+def _parse_control_line(line, url_resolver, line_number, record_number):
+    # control: oid [criticality] [value-spec], returns (oid, criticality, value)
+    body = line[len('control'):]
+    if not body.startswith(':'):
+        raise LDAPLDIFParseError('invalid control line: ' + line, line_number=line_number, record_number=record_number)
+    body = body[1:].lstrip(' ')
+    oid, _, remainder = body.partition(' ')
+    if not oid:
+        raise LDAPLDIFParseError('missing OID in control line: ' + line, line_number=line_number, record_number=record_number)
+    criticality = None
+    value = None
+    if remainder.startswith('true') and (len(remainder) == 4 or remainder[4] in ': '):
+        criticality = True
+        remainder = remainder[4:]
+    elif remainder.startswith('false') and (len(remainder) == 5 or remainder[5] in ': '):
+        criticality = False
+        remainder = remainder[5:]
+    remainder = remainder.lstrip(' ')
+    if remainder:
+        if not remainder.startswith(':'):
+            raise LDAPLDIFParseError('invalid control value in line: ' + line, line_number=line_number, record_number=record_number)
+        value = _value_from_suffix(remainder, url_resolver, line_number, record_number)
+    return oid, criticality, value
+
+
+def _as_text(value, description, line_number, record_number):
+    if isinstance(value, STRING_TYPES):
+        return value
+    try:
+        return str(value, encoding='utf-8')
+    except UnicodeDecodeError:
+        raise LDAPLDIFParseError('invalid utf-8 in ' + description, line_number=line_number, record_number=record_number)
+
+
+def _parse_change_record(lines, records_seen, version_seen, url_resolver):
+    # lines is a list of (line_number, text) logical lines of a single record,
+    # returns (operation, version_seen); operation is None for a version-only chunk
+    record_number = records_seen + 1
+    pos = 0
+    line_number, line = lines[0]
+    descriptor, value = _parse_value_spec(line, url_resolver, line_number, record_number)
+    if descriptor.lower() == 'version':
+        if version_seen or records_seen:
+            raise LDAPLDIFParseError('version directive must precede all change records', line_number=line_number, record_number=record_number)
+        if _as_text(value, 'version', line_number, record_number).strip() != '1':
+            raise LDAPLDIFParseError('unsupported LDIF version: ' + _as_text(value, 'version', line_number, record_number), line_number=line_number, record_number=record_number)
+        version_seen = True
+        pos = 1
+        if pos == len(lines):
+            return None, version_seen
+        line_number, line = lines[pos]
+        descriptor, value = _parse_value_spec(line, url_resolver, line_number, record_number)
+
+    if descriptor.lower() != 'dn':
+        raise LDAPLDIFParseError('change record must start with a dn line', line_number=line_number, record_number=record_number)
+    dn = value
+    pos += 1
+
+    controls = []
+    while pos < len(lines) and lines[pos][1].lower().startswith('control:'):
+        control_line_number, control_line = lines[pos]
+        controls.append(_parse_control_line(control_line, url_resolver, control_line_number, record_number))
+        pos += 1
+
+    if pos >= len(lines):
+        raise LDAPLDIFParseError('missing changetype in change record', line_number=lines[-1][0], record_number=record_number)
+    line_number, line = lines[pos]
+    descriptor, value = _parse_value_spec(line, url_resolver, line_number, record_number)
+    if descriptor.lower() != 'changetype':
+        raise LDAPLDIFParseError('expected changetype in change record', line_number=line_number, record_number=record_number)
+    change_type = _as_text(value, 'changetype', line_number, record_number).lower()
+    pos += 1
+
+    if change_type == 'add':
+        operation = _parse_add_body(dn, controls, lines, pos, url_resolver, record_number)
+    elif change_type == 'delete':
+        if pos < len(lines):
+            raise LDAPLDIFParseError('unexpected content in delete change record', line_number=lines[pos][0], record_number=record_number)
+        operation = {'operation': 'delete', 'dn': dn, 'controls': controls}
+    elif change_type == 'modify':
+        operation = _parse_modify_body(dn, controls, lines, pos, url_resolver, record_number)
+    elif change_type in ('modrdn', 'moddn'):
+        operation = _parse_modrdn_body(dn, controls, lines, pos, url_resolver, record_number)
+    else:
+        raise LDAPLDIFParseError('unknown changetype: ' + change_type, line_number=line_number, record_number=record_number)
+
+    return operation, version_seen
+
+
+def _parse_add_body(dn, controls, lines, pos, url_resolver, record_number):
+    attributes = dict()
+    for line_number, line in lines[pos:]:
+        descriptor, value = _parse_value_spec(line, url_resolver, line_number, record_number)
+        attributes.setdefault(descriptor, []).append(value)
+    return {'operation': 'add', 'dn': dn, 'controls': controls, 'attributes': attributes}
+
+
+def _parse_modify_body(dn, controls, lines, pos, url_resolver, record_number):
+    changes = []
+    mod_operation = None
+    mod_attribute = None
+    mod_values = None
+    mod_line_number = None
+    for line_number, line in lines[pos:]:
+        if line == '-':  # ends only the current modification block
+            if mod_operation is None:
+                raise LDAPLDIFParseError('separator without an open modification in modify record', line_number=line_number, record_number=record_number)
+            changes.append((mod_operation, mod_attribute, mod_values))
+            mod_operation = None
+            continue
+        if mod_operation is None:
+            sep_pos = line.find(':')
+            if sep_pos <= 0:
+                raise LDAPLDIFParseError('invalid modification line in modify record: ' + line, line_number=line_number, record_number=record_number)
+            mod_operation = line[:sep_pos].lower()
+            if mod_operation not in _LDIF_MODIFY_OPERATIONS:
+                raise LDAPLDIFParseError('unknown modification type: ' + line[:sep_pos], line_number=line_number, record_number=record_number)
+            mod_attribute = line[sep_pos + 1:].lstrip(' ')
+            mod_values = []
+            mod_line_number = line_number
+        else:
+            descriptor, value = _parse_value_spec(line, url_resolver, line_number, record_number)
+            if descriptor.lower() != mod_attribute.lower():
+                raise LDAPLDIFParseError('attribute ' + descriptor + ' does not match modification attribute ' + mod_attribute, line_number=line_number, record_number=record_number)
+            mod_values.append(value)
+    if mod_operation is not None:
+        raise LDAPLDIFParseError('unclosed modification in modify record', line_number=mod_line_number, record_number=record_number)
+    return {'operation': 'modify', 'dn': dn, 'controls': controls, 'changes': changes}
+
+
+def _parse_modrdn_body(dn, controls, lines, pos, url_resolver, record_number):
+    new_rdn = None
+    delete_old_rdn = None
+    new_superior = None
+    seen = set()
+    for line_number, line in lines[pos:]:
+        descriptor, value = _parse_value_spec(line, url_resolver, line_number, record_number)
+        descriptor_lower = descriptor.lower()
+        if descriptor_lower not in ('newrdn', 'deleteoldrdn', 'newsuperior'):
+            raise LDAPLDIFParseError('unexpected line in modrdn change record: ' + descriptor, line_number=line_number, record_number=record_number)
+        if descriptor_lower in seen:
+            raise LDAPLDIFParseError('duplicated line in modrdn change record: ' + descriptor, line_number=line_number, record_number=record_number)
+        seen.add(descriptor_lower)
+        if descriptor_lower == 'newrdn':
+            new_rdn = value
+        elif descriptor_lower == 'newsuperior':
+            new_superior = value
+        else:
+            flag = _as_text(value, 'deleteoldrdn', line_number, record_number).lower()
+            if flag in ('1', 'true'):
+                delete_old_rdn = True
+            elif flag in ('0', 'false'):
+                delete_old_rdn = False
+            else:
+                raise LDAPLDIFParseError('invalid deleteoldrdn value: ' + flag, line_number=line_number, record_number=record_number)
+    if new_rdn is None:
+        raise LDAPLDIFParseError('missing newrdn in modrdn change record', line_number=lines[-1][0], record_number=record_number)
+    if delete_old_rdn is None:
+        raise LDAPLDIFParseError('missing deleteoldrdn in modrdn change record', line_number=lines[-1][0], record_number=record_number)
+    return {'operation': 'modrdn', 'dn': dn, 'controls': controls, 'new_rdn': new_rdn, 'delete_old_rdn': delete_old_rdn, 'new_superior': new_superior}
+
+
+def ldif_change_records(source, url_resolver=None, encoding='utf-8'):
+    """
+    Reads an LDIF change stream (RFC 2849) and yields one operation dict per
+    change record, in stream order. Nothing is sent to any server; the caller
+    decides whether to execute each returned operation.
+
+    source can be a file-like object (text or binary) or any iterable of
+    str/bytes chunks. url_resolver, when provided, is called with the URL of
+    every ":<" value and must return its content; without it URL values raise
+    LDAPLDIFParseError and no network or file access is ever attempted.
+
+    Operation dicts:
+    add:    {'operation': 'add', 'dn': dn, 'controls': controls, 'attributes': {attr: [values]}}
+    delete: {'operation': 'delete', 'dn': dn, 'controls': controls}
+    modify: {'operation': 'modify', 'dn': dn, 'controls': controls, 'changes': [(op, attr, [values])]}
+    modrdn: {'operation': 'modrdn', 'dn': dn, 'controls': controls, 'new_rdn': rdn,
+             'delete_old_rdn': bool, 'new_superior': dn or None}
+
+    controls is a list of (oid, criticality, value) tuples; criticality is
+    None when not specified. Plain values are str, base64 and URL values are
+    bytes. A record is yielded only when complete; malformed or unclosed
+    records raise LDAPLDIFParseError with physical line and record numbers.
+    """
+    records_seen = 0
+    version_seen = False
+    pending = []
+    for line_number, line in _iter_logical_lines(source, encoding):
+        if not line:  # blank line closes the current record
+            if pending:
+                operation, version_seen = _parse_change_record(pending, records_seen, version_seen, url_resolver)
+                pending = []
+                if operation is not None:
+                    records_seen += 1
+                    yield operation
+            continue
+        if line.startswith('#'):  # comment lines never start a record
+            continue
+        pending.append((line_number, line))
+    if pending:
+        operation, version_seen = _parse_change_record(pending, records_seen, version_seen, url_resolver)
+        if operation is not None:
+            yield operation

@@ -482,6 +482,26 @@ class LDAPLDIFError(LDAPExceptionError):
     pass
 
 
+class LDAPLDIFParseError(LDAPLDIFError):
+    """Error raised while parsing an LDIF stream.
+
+    Carries the physical line number (1-based) and the change record
+    number (1-based) where the error was detected.
+    """
+
+    def __init__(self, message, line_number=None, record_number=None):
+        self.line_number = line_number
+        self.record_number = record_number
+        details = []
+        if record_number is not None:
+            details.append('record ' + str(record_number))
+        if line_number is not None:
+            details.append('line ' + str(line_number))
+        if details:
+            message += ' (' + ', '.join(details) + ')'
+        LDAPLDIFError.__init__(self, message)
+
+
 class LDAPSchemaError(LDAPExceptionError):
     pass
 
