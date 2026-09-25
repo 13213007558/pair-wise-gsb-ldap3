@@ -255,6 +255,7 @@ class Connection(object):
             self.listening = False
             self.closed = True
             self.last_error = None
+            self.aborted_transaction_notices = []  # transaction identifiers received in Aborted Transaction Notices (RFC5805)
             if auto_bind is False:  # compatibility with older version where auto_bind was a boolean
                 self.auto_bind = AUTO_BIND_DEFAULT
             elif auto_bind is True:

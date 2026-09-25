@@ -25,6 +25,8 @@
 
 import socket, base64
 
+from pyasn1.type.univ import OctetString
+
 from .. import SEQUENCE_TYPES, get_config_parameter, DIGEST_MD5, NTLM, ENCRYPT, GSSAPI
 from ..core.exceptions import LDAPSocketReceiveError, communication_exception_factory, LDAPExceptionError, LDAPExtensionError, LDAPOperationResult, LDAPSignatureVerificationFailedError
 from ..strategy.base import BaseStrategy, SESSION_TERMINATED_BY_SERVER, RESPONSE_COMPLETE, TRANSACTION_ERROR
@@ -235,6 +237,13 @@ class SyncStrategy(BaseStrategy):
                                 return SESSION_TERMINATED_BY_SERVER
                             elif dict_response['responseName'] == '2.16.840.1.113719.1.27.103.4':  # Novell LDAP transaction error unsolicited notification
                                 return TRANSACTION_ERROR
+                            elif dict_response['responseName'] == '1.3.6.1.1.21.4':  # Aborted Transaction Notice as per RFC5805 (section 5)
+                                aborted_transaction_id = None
+                                if dict_response['responseValue']:
+                                    aborted_transaction_id = bytes(decoder.decode(dict_response['responseValue'], asn1Spec=OctetString())[0])
+                                self.connection.aborted_transaction_notices.append(aborted_transaction_id)
+                                if log_enabled(ERROR):
+                                    log(ERROR, 'transaction aborted by server via <%s>', self.connection)
                             else:
                                 self.connection.last_error = 'unknown unsolicited notification from server'
                                 if log_enabled(ERROR):

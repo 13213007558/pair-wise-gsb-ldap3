@@ -12,6 +12,13 @@ The extend.standard namespace contains extended operation defined in current RFC
             hash_algorithm=None,
             salt=None
         )
+        extend.standard.start_transaction(controls=None)
+        extend.standard.end_transaction(
+            transaction_id,
+            commit=True,
+            controls=None
+        )
+        extend.standard.transaction(controls=None)
         extend.standard.paged_search(search_base,
             search_filter,
             search_scope,
@@ -218,3 +225,50 @@ When using next(block=False) or next(block=True, timeout=10) the method returns 
 If you call the persistent_search() method with **callback=myfunction** (where myfunction is a callable, including lambda,
 accepting a dict as parameter) your function will be called for each event received in the persistent serach.
 The function will be called in the same thread of the persistent search, so it should not block.
+
+
+Transactions (RFC5805)
+----------------------
+
+Servers that support RFC5805 (Lightweight Directory Access Protocol Transactions) can apply a group of
+add, delete, modify and modify_dn operations atomically. The ldap3 library implements the standard
+Start Transaction (1.3.6.1.1.21.1) and End Transaction (1.3.6.1.1.21.3) extended operations and the
+Transaction Specification control (1.3.6.1.1.21.2). These are independent of the Novell grouping
+transaction operations available in the extend.novell namespace.
+
+The simplest way to use a transaction is the context manager returned by ``extend.standard.transaction()``;
+the transaction is committed when the block exits cleanly and aborted when an exception is raised::
+
+    from ldap3 import Server, Connection, MODIFY_REPLACE
+    s = Server(...)
+    c = Connection(s, ...)
+    c.bind()
+    with c.extend.standard.transaction() as t:
+        t.add('cn=user1,o=test', 'inetOrgPerson', {'sn': ['user1']})
+        t.modify('cn=user2,o=test', {'givenName': (MODIFY_REPLACE, ['new name'])})
+        t.delete('cn=user3,o=test')
+    t.committed  # True if the transaction has been committed by the server
+
+You can also manage the transaction explicitly with ``start()``, ``commit()`` and ``abort()``::
+
+    t = c.extend.standard.transaction().start()
+    t.add('cn=user1,o=test', 'inetOrgPerson', {'sn': ['user1']})
+    if everything_is_fine:
+        t.commit()
+    else:
+        t.abort()
+
+Only the add, delete, modify and modify_dn requests issued through the transaction object carry the
+Transaction Specification control; other requests sent on the same connection are not affected.
+The transaction object records the message id of every update it sends, so when a commit fails you can
+identify the failed operation with ``t.failed_message_id`` and ``t.failed_operation``; the response
+controls returned by the server for each update are available in ``t.update_controls``.
+
+If the server aborts the transaction by itself it sends an Aborted Transaction Notice
+(1.3.6.1.1.21.4); the received transaction identifiers are stored in the
+``connection.aborted_transaction_notices`` list and ``t.server_aborted`` (and ``t.aborted``) become True.
+
+The low level extended operations are also available directly: ``extend.standard.start_transaction()``
+returns the opaque transaction identifier and ``extend.standard.end_transaction(transaction_id, commit=True)``
+ends the transaction; in this case you must attach the Transaction Specification control to each update
+request yourself (see ``ldap3.protocol.rfc5805.build_transaction_control()``).

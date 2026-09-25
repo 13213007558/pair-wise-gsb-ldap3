@@ -2,6 +2,9 @@
     - fixed IndexError in auto_range search when response has no ranged attributes
     - fixed TypeError in format_ad_timedelta with malformed AD timestamps
     - Allow empty base for mocks
+    - added RFC5805 LDAP Transactions: extend.standard.start_transaction(), extend.standard.end_transaction()
+      and the extend.standard.transaction() context manager; the Aborted Transaction Notice unsolicited
+      notification is now recognized and recorded in connection.aborted_transaction_notices
 
 # 2.10.2rc3 . 2025.04.19
     - tested against Python 3.13

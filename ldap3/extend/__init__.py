@@ -48,6 +48,9 @@ from .standard.whoAmI import WhoAmI
 from .standard.modifyPassword import ModifyPassword
 from .standard.PagedSearch import paged_search_generator, paged_search_accumulator
 from .standard.PersistentSearch import PersistentSearch
+from .standard.startTransaction import StartTransaction as RfcStartTransaction
+from .standard.endTransaction import EndTransaction as RfcEndTransaction
+from .standard.transaction import Transaction
 
 
 class ExtendedOperationContainer(object):
@@ -197,6 +200,20 @@ class StandardExtendedOperations(ExtendedOperationContainer):
                                 None,
                                 streaming,
                                 callback)
+
+    def start_transaction(self, controls=None):  # RFC5805, returns the opaque transaction identifier
+        return RfcStartTransaction(self._connection,
+                                   controls).send()
+
+    def end_transaction(self, transaction_id, commit=True, controls=None):  # RFC5805
+        return RfcEndTransaction(self._connection,
+                                 transaction_id,
+                                 commit,
+                                 controls).send()
+
+    def transaction(self, controls=None):  # RFC5805, returns a Transaction context manager
+        return Transaction(self._connection,
+                           controls)
 
 
 class NovellExtendedOperations(ExtendedOperationContainer):

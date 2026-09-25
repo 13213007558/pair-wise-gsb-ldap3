@@ -26,6 +26,8 @@
 from threading import Thread, Lock, Event
 import socket
 
+from pyasn1.type.univ import OctetString
+
 from .. import get_config_parameter, DIGEST_MD5, ENCRYPT
 from ..core.exceptions import LDAPSSLConfigurationError, LDAPStartTLSError, LDAPOperationResult, LDAPSignatureVerificationFailedError, LDAPConfigurationError
 from ..strategy.base import BaseStrategy, RESPONSE_COMPLETE
@@ -176,6 +178,16 @@ class AsyncStrategy(BaseStrategy):
                     else:  # Unsolicited Notification
                         if dict_response['responseName'] == '1.3.6.1.4.1.1466.20036':  # Notice of Disconnection as per RFC4511 (paragraph 4.4.1)
                             listen = False
+                        elif dict_response['responseName'] == '1.3.6.1.1.21.4':  # Aborted Transaction Notice as per RFC5805 (section 5)
+                            aborted_transaction_id = None
+                            if dict_response['responseValue']:
+                                aborted_transaction_id = bytes(decoder.decode(dict_response['responseValue'], asn1Spec=OctetString())[0])
+                            self.connection.aborted_transaction_notices.append(aborted_transaction_id)
+                            if log_enabled(ERROR):
+                                log(ERROR, 'transaction aborted by server via <%s>', self.connection)
+                            unprocessed = unprocessed[length:]
+                            get_more_data = False if unprocessed else True
+                            listen = True if self.connection.listening or unprocessed else False
                         else:
                             self.connection.last_error = 'unknown unsolicited notification from server'
                             if log_enabled(ERROR):
