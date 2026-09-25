@@ -45,7 +45,8 @@ from ..utils.conv import json_hook, to_unicode, to_raw
 from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
-    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
+    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN, \
+    RESULT_ALIAS_PROBLEM, RESULT_ALIAS_DEREFERENCING_PROBLEM, RESULT_LOOP_DETECTED
 from ..utils.ciDict import CaseInsensitiveDict
 from ..utils.dn import to_dn, safe_dn, safe_rdn
 from ..protocol.sasl.sasl import validate_simple_password
@@ -662,6 +663,40 @@ class MockBaseStrategy(object):
         else:
             return self._execute_search(request)
 
+    def _is_alias_entry(self, dn):
+        # an alias entry has the 'alias' object class and points to another entry with the aliasedObjectName attribute
+        if dn in self.connection.server.dit and 'objectClass' in self.connection.server.dit[dn]:
+            for object_class in self.connection.server.dit[dn]['objectClass']:
+                if to_unicode(object_class, SERVER_ENCODING).lower() == 'alias':
+                    return True
+        return False
+
+    def _canonical_dn(self, dn):
+        # returns the dn with the same casing used to store the entry in the dit
+        for stored_dn in self.connection.server.dit:
+            if stored_dn.lower() == dn.lower():
+                return stored_dn
+        return dn
+
+    def _dereference_alias(self, dn):
+        # follows an alias chain up to the referenced entry, returns (dn, result_code, message)
+        traversed = set()
+        aliased_dn = dn
+        while self._is_alias_entry(aliased_dn):
+            if aliased_dn.lower() in traversed:
+                return None, RESULT_LOOP_DETECTED, 'alias loop detected at ' + aliased_dn
+            traversed.add(aliased_dn.lower())
+            if 'aliasedObjectName' not in self.connection.server.dit[aliased_dn]:
+                return None, RESULT_ALIAS_DEREFERENCING_PROBLEM, 'alias entry ' + aliased_dn + ' is missing the aliasedObjectName attribute'
+            try:
+                target = safe_dn(to_unicode(self.connection.server.dit[aliased_dn]['aliasedObjectName'][0], SERVER_ENCODING))
+            except Exception:
+                return None, RESULT_ALIAS_DEREFERENCING_PROBLEM, 'alias entry ' + aliased_dn + ' has an invalid aliasedObjectName value'
+            if target not in self.connection.server.dit:
+                return None, RESULT_ALIAS_PROBLEM, 'alias entry ' + aliased_dn + ' points to non-existent entry ' + target
+            aliased_dn = target
+        return self._canonical_dn(aliased_dn), RESULT_SUCCESS, ''
+
     def _execute_search(self, request):
         responses = []
         if request['base']:
@@ -669,6 +704,7 @@ class MockBaseStrategy(object):
         else:
             base = request['base']
         scope = request['scope']
+        deref_aliases = request['dereferenceAlias']
         attributes = request['attributes']
         if '+' in attributes:  # operational attributes requested
             attributes.extend(self.operational_attributes)
@@ -677,20 +713,64 @@ class MockBaseStrategy(object):
         attributes = [attr.lower() for attr in request['attributes']]
 
         filter_root = parse_filter(request['filter'], self.connection.server.schema, auto_escape=True, auto_encode=False, validator=self.connection.server.custom_validator, check_names=self.connection.check_names)
+
+        # dereferences the base object when it is an alias and the search asks for it (derefFindingBaseObj or derefAlways)
+        if deref_aliases in (2, 3) and self._is_alias_entry(base):
+            base, result_code, message = self._dereference_alias(base)
+            if result_code:
+                return [], {'resultCode': result_code,
+                            'matchedDN': '',
+                            'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                            'referral': None
+                            }
+
         candidates = []
         if scope == 0:  # base object
             if base in self.connection.server.dit or base.lower() == 'cn=schema':
                 candidates.append(base)
         elif scope == 1:  # single level
             for entry in self.connection.server.dit:
-                if entry.lower().endswith(base.lower()) and ',' not in entry[:-len(base) - 1]:  # only leafs without commas in the remaining dn
+                if entry.lower() != base.lower() and entry.lower().endswith(base.lower()) and ',' not in entry[:-len(base) - 1]:  # only leafs without commas in the remaining dn
                     candidates.append(entry)
         elif scope == 2:  # whole subtree
             for entry in self.connection.server.dit:
                 if entry.lower().endswith(base.lower()):
                     candidates.append(entry)
 
-        if not candidates:  # incorrect base
+        # dereferences aliases found while searching (derefInSearching or derefAlways); the base object itself is never dereferenced here
+        if deref_aliases in (1, 3) and scope != 0:
+            expanded_candidates = []
+            seen_dns = set()
+            processed_aliases = set()
+            pending = list(candidates)
+            while pending:
+                candidate = pending.pop(0)
+                candidate_key = candidate.lower()
+                if candidate_key in seen_dns:
+                    continue
+                seen_dns.add(candidate_key)
+                if candidate_key != base.lower() and self._is_alias_entry(candidate):
+                    if candidate_key in processed_aliases:
+                        continue
+                    processed_aliases.add(candidate_key)
+                    target, result_code, message = self._dereference_alias(candidate)
+                    if result_code:
+                        return [], {'resultCode': result_code,
+                                    'matchedDN': '',
+                                    'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                                    'referral': None
+                                    }
+                    if scope == 1:  # single level, only the aliased object is added to the candidates
+                        pending.append(target)
+                    else:  # whole subtree, the aliased object and all its subordinates are added to the candidates
+                        for entry in self.connection.server.dit:
+                            if entry.lower() == target.lower() or entry.lower().endswith(',' + target.lower()):
+                                pending.append(entry)
+                else:
+                    expanded_candidates.append(candidate)
+            candidates = expanded_candidates
+
+        if not candidates and base not in self.connection.server.dit and base.lower() != 'cn=schema':  # incorrect base
             result_code = RESULT_NO_SUCH_OBJECT
             message = 'incorrect base object'
         else:
