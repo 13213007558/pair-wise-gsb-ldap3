@@ -137,7 +137,11 @@ def evaluate_match(match, schema, auto_escape, auto_encode, validator, check_nam
             raise LDAPInvalidFilterError('invalid extensible filter')
         attribute_name = attribute_name.strip() if attribute_name else False
         matching_rule = matching_rule.strip() if matching_rule else False
-        assertion = {'attr': attribute_name, 'value': validate_assertion_value(schema, attribute_name, right_part, auto_escape, auto_encode, validator, check_names), 'matchingRule': matching_rule, 'dnAttributes': dn_attributes}
+        if attribute_name:
+            assertion_value = validate_assertion_value(schema, attribute_name, right_part, auto_escape, auto_encode, validator, check_names)
+        else:  # no attribute to validate the assertion value against
+            assertion_value = to_raw(to_unicode(right_part))
+        assertion = {'attr': attribute_name, 'value': assertion_value, 'matchingRule': matching_rule, 'dnAttributes': dn_attributes}
     elif right_part == '*':  # attribute present match '=*'
         tag = MATCH_PRESENT
         left_part = left_part.strip()
@@ -455,7 +459,18 @@ def checked_attributes_to_dict_fast(attribute_list, schema=None, custom_formatte
 
 
 def matching_rule_assertion_to_string(matching_rule_assertion):
-    return str(matching_rule_assertion)
+    # rebuilds the RFC 4515 string representation [attr][:dn][:matchingRule]:=assertionValue
+    filter_string = ''
+    if matching_rule_assertion['type'].hasValue():
+        filter_string += str(matching_rule_assertion['type'])
+    if matching_rule_assertion['dnAttributes'].hasValue() and bool(matching_rule_assertion['dnAttributes']):
+        filter_string += ':dn'
+    if matching_rule_assertion['matchingRule'].hasValue():
+        filter_string += ':' + str(matching_rule_assertion['matchingRule'])
+    filter_string += ':='
+    if matching_rule_assertion['matchValue'].hasValue():  # the value keeps its original RFC 4515 escapes
+        filter_string += str(matching_rule_assertion['matchValue'])
+    return filter_string
 
 
 def filter_to_string(filter_object):
