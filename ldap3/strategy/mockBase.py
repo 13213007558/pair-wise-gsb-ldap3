@@ -444,35 +444,62 @@ class MockBaseStrategy(object):
         new_rdn = request['newRdn']
         delete_old_rdn = request['deleteOldRdn']
         new_superior = safe_dn(request['newSuperior']) if request['newSuperior'] else ''
-        dn_components = to_dn(dn)
-        if dn in self.connection.server.dit:
-            if new_superior and new_rdn:  # performs move in the DIT
-                new_dn = safe_dn(dn_components[0] + ',' + new_superior)
-                self.connection.server.dit[new_dn] = self.connection.server.dit[dn].copy()
-                moved_entry = self.connection.server.dit[new_dn]
-                if delete_old_rdn:
-                    del self.connection.server.dit[dn]
-                result_code = RESULT_SUCCESS
-                message = 'entry moved'
-                moved_entry['entryDN'] = [to_raw(new_dn)]
-            elif new_rdn and not new_superior:  # performs rename
-                new_dn = safe_dn(new_rdn + ',' + safe_dn(dn_components[1:]))
-                self.connection.server.dit[new_dn] = self.connection.server.dit[dn].copy()
-                renamed_entry = self.connection.server.dit[new_dn]
-                del self.connection.server.dit[dn]
-                renamed_entry['entryDN'] = [to_raw(new_dn)]
-
-                for rdn in safe_rdn(new_dn, decompose=True):  # adds rdns to entry attributes
-                    renamed_entry[rdn[0]] = [to_raw(rdn[1])]
-
-                result_code = RESULT_SUCCESS
-                message = 'entry rdn renamed'
-            else:
-                result_code = RESULT_UNWILLING_TO_PERFORM
-                message = 'newRdn or newSuperior missing'
-        else:
+        if dn not in self.connection.server.dit:
             result_code = RESULT_NO_SUCH_OBJECT
             message = 'object not found'
+        elif not new_rdn:
+            result_code = RESULT_UNWILLING_TO_PERFORM
+            message = 'newRdn missing'
+        elif new_superior and new_superior not in self.connection.server.dit:
+            result_code = RESULT_NO_SUCH_OBJECT
+            message = 'new superior object not found'
+        elif new_superior and (new_superior.lower() == dn.lower() or new_superior.lower().endswith(',' + dn.lower())):
+            result_code = RESULT_UNWILLING_TO_PERFORM
+            message = 'cannot move an entry under itself or one of its descendants'
+        else:
+            if new_superior:  # performs move in the DIT
+                parent_dn = new_superior
+            else:  # performs rename, parent doesn't change
+                parent_dn = safe_dn(','.join(to_dn(dn)[1:]))
+            new_dn = safe_dn(new_rdn + ',' + parent_dn) if parent_dn else safe_dn(new_rdn)
+            # collects the whole subtree being moved, descendants included
+            moved_dns = [entry_dn for entry_dn in self.connection.server.dit if entry_dn.lower() == dn.lower() or entry_dn.lower().endswith(',' + dn.lower())]
+            moved_dns_lower = set(entry_dn.lower() for entry_dn in moved_dns)
+            dn_mapping = dict()
+            collision = False
+            for old_dn in moved_dns:
+                mapped_dn = safe_dn(old_dn[:len(old_dn) - len(dn)] + new_dn)  # keeps the descendant prefix and replaces the moved base
+                if mapped_dn.lower() not in moved_dns_lower and mapped_dn in self.connection.server.dit:  # target already exists outside the moved subtree
+                    collision = True
+                    break
+                dn_mapping[old_dn] = mapped_dn
+            if collision:
+                result_code = RESULT_ENTRY_ALREADY_EXISTS
+                message = 'entry already exist'
+            else:
+                with self.connection.server.dit_lock:
+                    for old_dn in moved_dns:
+                        mapped_dn = dn_mapping[old_dn]
+                        entry = self.connection.server.dit[old_dn]
+                        del self.connection.server.dit[old_dn]
+                        if old_dn.lower() == dn.lower():  # applies the rdn attribute semantics to the renamed entry only
+                            if delete_old_rdn:  # removes the old rdn values from the entry attributes
+                                for rdn_attribute, rdn_value in safe_rdn(old_dn, decompose=True):
+                                    if rdn_attribute in entry:
+                                        raw_rdn_value = to_raw(rdn_value)
+                                        if raw_rdn_value in entry[rdn_attribute]:
+                                            entry[rdn_attribute].remove(raw_rdn_value)
+                                        if not entry[rdn_attribute]:
+                                            del entry[rdn_attribute]
+                            for rdn_attribute, rdn_value in safe_rdn(mapped_dn, decompose=True):  # adds the new rdn values to the entry attributes
+                                if rdn_attribute not in entry:
+                                    entry[rdn_attribute] = [to_raw(rdn_value)]
+                                elif to_raw(rdn_value) not in entry[rdn_attribute]:
+                                    entry[rdn_attribute].append(to_raw(rdn_value))
+                        entry['entryDN'] = [to_raw(mapped_dn)]
+                        self.connection.server.dit[mapped_dn] = entry
+                result_code = RESULT_SUCCESS
+                message = 'entry moved' if new_superior else 'entry rdn renamed'
 
         return {'resultCode': result_code,
                 'matchedDN': '',

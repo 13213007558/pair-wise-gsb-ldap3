@@ -79,6 +79,31 @@ class Test(unittest.TestCase):
         self.connection_3.unbind()
         self.assertFalse(self.connection_3.bound)
 
+    def _modify_dn(self, connection, dn, relative_dn, delete_old_dn=True, new_superior=None):
+        result = connection.modify_dn(dn, relative_dn, delete_old_dn=delete_old_dn, new_superior=new_superior)
+        if not connection.strategy.sync:
+            _, result = connection.get_response(result)
+        else:
+            result = connection.result
+        return result
+
+    def _search(self, connection, base, search_filter, search_scope):
+        result = connection.search(base, search_filter, search_scope=search_scope, attributes=['cn', 'sn', 'ou'])
+        response = connection.response
+        if not connection.strategy.sync:
+            response, result = connection.get_response(result)
+        else:
+            result = connection.result
+        return response, result
+
+    def _add_subtree_fixtures(self, connection):
+        connection.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
+        connection.strategy.add_entry('ou=tree,o=lab', {'ou': 'tree'})
+        connection.strategy.add_entry('cn=leaf1,ou=tree,o=lab', {'cn': 'leaf1', 'sn': 'leaf1_sn'})
+        connection.strategy.add_entry('cn=leaf2,ou=tree,o=lab', {'cn': 'leaf2', 'sn': 'leaf2_sn'})
+        connection.strategy.add_entry('ou=branch,ou=tree,o=lab', {'ou': 'branch'})
+        connection.strategy.add_entry('cn=deep,ou=branch,ou=tree,o=lab', {'cn': 'deep', 'sn': 'deep_sn'})
+
     def test_open_1(self):
         self.connection_1.open()
         self.assertFalse(self.connection_1.closed)
@@ -401,6 +426,7 @@ class Test(unittest.TestCase):
     def test_move_dn_1(self):
         dn = 'cn=user4,ou=test,o=lab'
         self.connection_1.bind()
+        self.connection_1.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
         result = self.connection_1.modify_dn(dn, relative_dn='cn=user4', new_superior='ou=moved,o=lab')
         if not self.connection_1.strategy.sync:
             _, result = self.connection_1.get_response(result)
@@ -413,6 +439,7 @@ class Test(unittest.TestCase):
     def test_move_dn_2(self):
         dn = 'cn=user4,ou=test,o=lab'
         self.connection_2.bind()
+        self.connection_2.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
         result = self.connection_2.modify_dn(dn, relative_dn='cn=user4', new_superior='ou=moved,o=lab')
         if not self.connection_2.strategy.sync:
             _, result = self.connection_2.get_response(result)
@@ -425,6 +452,7 @@ class Test(unittest.TestCase):
     def test_move_dn_3(self):
         dn = 'cn=user4,ou=test,o=lab'
         self.connection_3.bind()
+        self.connection_3.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
         result = self.connection_3.modify_dn(dn, relative_dn='cn=user4', new_superior='ou=moved,o=lab')
         if not self.connection_3.strategy.sync:
             _, result = self.connection_3.get_response(result)
@@ -469,6 +497,228 @@ class Test(unittest.TestCase):
         self.assertTrue(result['description'], 'success')
         self.assertTrue('cn=user_renamed,ou=test,o=lab' in self.connection_3.strategy.entries)
         self.assertFalse(dn in self.connection_3.strategy.entries)
+
+    def _check_move_dn_with_new_rdn(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
+        connection.bind()
+        result = self._modify_dn(connection, dn, 'cn=user4moved', new_superior='ou=moved,o=lab')
+        self.assertEqual(result['description'], 'success')
+        self.assertTrue('cn=user4moved,ou=moved,o=lab' in connection.strategy.entries)
+        self.assertFalse(dn in connection.strategy.entries)
+        moved_entry = connection.strategy.entries['cn=user4moved,ou=moved,o=lab']
+        self.assertEqual(moved_entry['entryDN'], [b'cn=user4moved,ou=moved,o=lab'])
+        self.assertTrue(b'user4moved' in moved_entry['cn'])
+        self.assertFalse(b'user4' in moved_entry['cn'])
+
+    def test_move_dn_with_new_rdn_1(self):
+        self._check_move_dn_with_new_rdn(self.connection_1)
+
+    def test_move_dn_with_new_rdn_2(self):
+        self._check_move_dn_with_new_rdn(self.connection_2)
+
+    def test_move_dn_with_new_rdn_3(self):
+        self._check_move_dn_with_new_rdn(self.connection_3)
+
+    def _check_move_dn_keep_old_rdn(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
+        connection.bind()
+        result = self._modify_dn(connection, dn, 'cn=user4moved', delete_old_dn=False, new_superior='ou=moved,o=lab')
+        self.assertEqual(result['description'], 'success')
+        # delete_old_dn=False keeps the old rdn value as a regular attribute value, the old entry is removed anyway
+        self.assertFalse(dn in connection.strategy.entries)
+        moved_entry = connection.strategy.entries['cn=user4moved,ou=moved,o=lab']
+        self.assertTrue(b'user4' in moved_entry['cn'])
+        self.assertTrue(b'user4moved' in moved_entry['cn'])
+
+    def test_move_dn_keep_old_rdn_1(self):
+        self._check_move_dn_keep_old_rdn(self.connection_1)
+
+    def test_move_dn_keep_old_rdn_2(self):
+        self._check_move_dn_keep_old_rdn(self.connection_2)
+
+    def test_move_dn_keep_old_rdn_3(self):
+        self._check_move_dn_keep_old_rdn(self.connection_3)
+
+    def _check_rename_dn_delete_old_rdn(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.bind()
+        result = self._modify_dn(connection, dn, 'cn=user_renamed')
+        self.assertEqual(result['description'], 'success')
+        self.assertFalse(dn in connection.strategy.entries)
+        renamed_entry = connection.strategy.entries['cn=user_renamed,ou=test,o=lab']
+        self.assertEqual(renamed_entry['entryDN'], [b'cn=user_renamed,ou=test,o=lab'])
+        self.assertFalse(b'user4' in renamed_entry['cn'])
+        self.assertTrue(b'user_renamed' in renamed_entry['cn'])
+
+    def test_rename_dn_delete_old_rdn_1(self):
+        self._check_rename_dn_delete_old_rdn(self.connection_1)
+
+    def test_rename_dn_delete_old_rdn_2(self):
+        self._check_rename_dn_delete_old_rdn(self.connection_2)
+
+    def test_rename_dn_delete_old_rdn_3(self):
+        self._check_rename_dn_delete_old_rdn(self.connection_3)
+
+    def _check_rename_dn_keep_old_rdn(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.bind()
+        result = self._modify_dn(connection, dn, 'cn=user_renamed', delete_old_dn=False)
+        self.assertEqual(result['description'], 'success')
+        self.assertFalse(dn in connection.strategy.entries)
+        renamed_entry = connection.strategy.entries['cn=user_renamed,ou=test,o=lab']
+        self.assertEqual(renamed_entry['entryDN'], [b'cn=user_renamed,ou=test,o=lab'])
+        self.assertTrue(b'user4' in renamed_entry['cn'])
+        self.assertTrue(b'user_renamed' in renamed_entry['cn'])
+
+    def test_rename_dn_keep_old_rdn_1(self):
+        self._check_rename_dn_keep_old_rdn(self.connection_1)
+
+    def test_rename_dn_keep_old_rdn_2(self):
+        self._check_rename_dn_keep_old_rdn(self.connection_2)
+
+    def test_rename_dn_keep_old_rdn_3(self):
+        self._check_rename_dn_keep_old_rdn(self.connection_3)
+
+    def _check_rename_dn_multivalued_rdn(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.bind()
+        result = self._modify_dn(connection, dn, 'cn=user4_multi+sn=user4_sn')
+        self.assertEqual(result['description'], 'success')
+        new_dn = 'cn=user4_multi+sn=user4_sn,ou=test,o=lab'
+        self.assertTrue(new_dn in connection.strategy.entries)
+        self.assertFalse(dn in connection.strategy.entries)
+        renamed_entry = connection.strategy.entries[new_dn]
+        self.assertEqual(renamed_entry['entryDN'], [b'cn=user4_multi+sn=user4_sn,ou=test,o=lab'])
+        self.assertEqual(renamed_entry['cn'], [b'user4_multi'])
+        self.assertEqual(renamed_entry['sn'], [b'user4_sn'])
+
+    def test_rename_dn_multivalued_rdn_1(self):
+        self._check_rename_dn_multivalued_rdn(self.connection_1)
+
+    def test_rename_dn_multivalued_rdn_2(self):
+        self._check_rename_dn_multivalued_rdn(self.connection_2)
+
+    def test_rename_dn_multivalued_rdn_3(self):
+        self._check_rename_dn_multivalued_rdn(self.connection_3)
+
+    def _check_move_dn_subtree(self, connection):
+        self._add_subtree_fixtures(connection)
+        connection.bind()
+        result = self._modify_dn(connection, 'ou=tree,o=lab', 'ou=tree', new_superior='ou=moved,o=lab')
+        self.assertEqual(result['description'], 'success')
+        moved_dns = ['ou=tree,ou=moved,o=lab',
+                     'cn=leaf1,ou=tree,ou=moved,o=lab',
+                     'cn=leaf2,ou=tree,ou=moved,o=lab',
+                     'ou=branch,ou=tree,ou=moved,o=lab',
+                     'cn=deep,ou=branch,ou=tree,ou=moved,o=lab']
+        old_dns = ['ou=tree,o=lab',
+                   'cn=leaf1,ou=tree,o=lab',
+                   'cn=leaf2,ou=tree,o=lab',
+                   'ou=branch,ou=tree,o=lab',
+                   'cn=deep,ou=branch,ou=tree,o=lab']
+        for moved_dn in moved_dns:
+            self.assertTrue(moved_dn in connection.strategy.entries)
+        for old_dn in old_dns:
+            self.assertFalse(old_dn in connection.strategy.entries)
+        self.assertEqual(connection.strategy.entries['cn=deep,ou=branch,ou=tree,ou=moved,o=lab']['entryDN'], [b'cn=deep,ou=branch,ou=tree,ou=moved,o=lab'])
+        # base scope search reflects the new tree structure
+        response, result = self._search(connection, 'ou=tree,ou=moved,o=lab', '(|(cn=*)(ou=*))', BASE)
+        self.assertEqual(result['description'], 'success')
+        self.assertEqual([entry['dn'] for entry in response], ['ou=tree,ou=moved,o=lab'])
+        # one-level scope search reflects the new tree structure
+        response, result = self._search(connection, 'ou=tree,ou=moved,o=lab', '(|(cn=*)(ou=*))', LEVEL)
+        self.assertEqual(result['description'], 'success')
+        level_dns = set(entry['dn'] for entry in response)
+        self.assertTrue(set(['cn=leaf1,ou=tree,ou=moved,o=lab', 'cn=leaf2,ou=tree,ou=moved,o=lab', 'ou=branch,ou=tree,ou=moved,o=lab']) <= level_dns)
+        self.assertTrue(all(entry_dn.endswith('ou=tree,ou=moved,o=lab') for entry_dn in level_dns))
+        # subtree scope search reflects the new tree structure
+        response, result = self._search(connection, 'ou=tree,ou=moved,o=lab', '(|(cn=*)(ou=*))', SUBTREE)
+        self.assertEqual(result['description'], 'success')
+        self.assertEqual(set(entry['dn'] for entry in response), set(moved_dns))
+        # nothing is found under the old location
+        response, result = self._search(connection, 'ou=tree,o=lab', '(|(cn=*)(ou=*))', SUBTREE)
+        self.assertEqual(result['description'], 'noSuchObject')
+
+    def test_move_dn_subtree_1(self):
+        self._check_move_dn_subtree(self.connection_1)
+
+    def test_move_dn_subtree_2(self):
+        self._check_move_dn_subtree(self.connection_2)
+
+    def test_move_dn_subtree_3(self):
+        self._check_move_dn_subtree(self.connection_3)
+
+    def _check_move_dn_to_existing_entry(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.bind()
+        dns_before = set(connection.strategy.entries.keys())
+        result = self._modify_dn(connection, dn, 'cn=user1')
+        self.assertEqual(result['description'], 'entryAlreadyExists')
+        self.assertEqual(set(connection.strategy.entries.keys()), dns_before)
+
+    def test_move_dn_to_existing_entry_1(self):
+        self._check_move_dn_to_existing_entry(self.connection_1)
+
+    def test_move_dn_to_existing_entry_2(self):
+        self._check_move_dn_to_existing_entry(self.connection_2)
+
+    def test_move_dn_to_existing_entry_3(self):
+        self._check_move_dn_to_existing_entry(self.connection_3)
+
+    def _check_move_dn_to_missing_superior(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.bind()
+        dns_before = set(connection.strategy.entries.keys())
+        result = self._modify_dn(connection, dn, 'cn=user4', new_superior='ou=nonexistent,o=lab')
+        self.assertEqual(result['description'], 'noSuchObject')
+        self.assertEqual(set(connection.strategy.entries.keys()), dns_before)
+
+    def test_move_dn_to_missing_superior_1(self):
+        self._check_move_dn_to_missing_superior(self.connection_1)
+
+    def test_move_dn_to_missing_superior_2(self):
+        self._check_move_dn_to_missing_superior(self.connection_2)
+
+    def test_move_dn_to_missing_superior_3(self):
+        self._check_move_dn_to_missing_superior(self.connection_3)
+
+    def _check_move_dn_into_own_descendant(self, connection):
+        self._add_subtree_fixtures(connection)
+        connection.bind()
+        dns_before = set(connection.strategy.entries.keys())
+        result = self._modify_dn(connection, 'ou=tree,o=lab', 'ou=tree', new_superior='ou=branch,ou=tree,o=lab')
+        self.assertEqual(result['description'], 'unwillingToPerform')
+        self.assertEqual(set(connection.strategy.entries.keys()), dns_before)
+
+    def test_move_dn_into_own_descendant_1(self):
+        self._check_move_dn_into_own_descendant(self.connection_1)
+
+    def test_move_dn_into_own_descendant_2(self):
+        self._check_move_dn_into_own_descendant(self.connection_2)
+
+    def test_move_dn_into_own_descendant_3(self):
+        self._check_move_dn_into_own_descendant(self.connection_3)
+
+    def _check_move_dn_case_collision(self, connection):
+        dn = 'cn=user4,ou=test,o=lab'
+        connection.strategy.add_entry('ou=moved,o=lab', {'ou': 'moved'})
+        connection.strategy.add_entry('CN=USER4,ou=moved,o=lab', {'cn': 'USER4', 'sn': 'user4_sn'})
+        connection.bind()
+        dns_before = set(connection.strategy.entries.keys())
+        result = self._modify_dn(connection, dn, 'cn=user4', new_superior='ou=moved,o=lab')
+        self.assertEqual(result['description'], 'entryAlreadyExists')
+        self.assertEqual(set(connection.strategy.entries.keys()), dns_before)
+
+    def test_move_dn_case_collision_1(self):
+        self._check_move_dn_case_collision(self.connection_1)
+
+    def test_move_dn_case_collision_2(self):
+        self._check_move_dn_case_collision(self.connection_2)
+
+    def test_move_dn_case_collision_3(self):
+        self._check_move_dn_case_collision(self.connection_3)
 
     def test_modify_add_existing_singlevalue_1(self):
         dn = 'cn=user4,ou=test,o=lab'
