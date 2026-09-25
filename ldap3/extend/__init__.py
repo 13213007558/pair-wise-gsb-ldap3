@@ -48,6 +48,7 @@ from .standard.whoAmI import WhoAmI
 from .standard.modifyPassword import ModifyPassword
 from .standard.PagedSearch import paged_search_generator, paged_search_accumulator
 from .standard.PersistentSearch import PersistentSearch
+from .standard.ContentSync import ContentSync
 
 
 class ExtendedOperationContainer(object):
@@ -197,6 +198,31 @@ class StandardExtendedOperations(ExtendedOperationContainer):
                                 None,
                                 streaming,
                                 callback)
+
+    def content_sync(self,
+                     search_base,
+                     search_filter='(objectclass=*)',
+                     search_scope=SUBTREE,
+                     dereference_aliases=DEREF_NEVER,
+                     attributes=ALL_ATTRIBUTES,
+                     size_limit=0,
+                     time_limit=0,
+                     controls=None,
+                     mode='refreshOnly',
+                     cookie=None,
+                     reload_hint=False):
+        return ContentSync(self._connection,
+                           search_base,
+                           search_filter,
+                           search_scope,
+                           dereference_aliases,
+                           attributes,
+                           size_limit,
+                           time_limit,
+                           controls,
+                           mode,
+                           cookie,
+                           reload_hint)
 
 
 class NovellExtendedOperations(ExtendedOperationContainer):

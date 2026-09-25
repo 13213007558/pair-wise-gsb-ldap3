@@ -59,6 +59,7 @@ from ..core.tls import Tls
 from ..protocol.oid import Oids
 from ..protocol.rfc2696 import RealSearchControlValue
 from ..protocol.microsoft import DirSyncControlResponseValue
+from ..protocol.rfc4533 import SYNC_STATE_NAMES, decode_sync_state_control_value, decode_sync_done_control_value
 from ..utils.log import log, log_enabled, ERROR, BASIC, PROTOCOL, NETWORK, EXTENDED, format_ldap_message
 from ..utils.asn1 import encode, decoder, ldap_result_to_dict_fast, decode_sequence
 from ..utils.conv import to_unicode
@@ -613,6 +614,10 @@ class BaseStrategy(object):
             control_resp, unprocessed = decoder.decode(control_value, asn1Spec=SearchResultEntry())
             control_value = dict()
             control_value['result'] = attributes_to_dict(control_resp['attributes'])
+        elif control_type == '1.3.6.1.4.1.4203.1.9.1.2':  # Sync State control as per RFC4533
+            control_value = decode_sync_state_control_value(control_value)
+        elif control_type == '1.3.6.1.4.1.4203.1.9.1.3':  # Sync Done control as per RFC4533
+            control_value = decode_sync_done_control_value(control_value)
         if unprocessed:
             if log_enabled(ERROR):
                 log(ERROR, 'unprocessed control response in substrate')
@@ -647,6 +652,22 @@ class BaseStrategy(object):
             control_resp = decode_sequence(control_value, 0, len(control_value))
             control_value = dict()
             control_value['result'] = attributes_to_dict_fast(control_resp[0][3][1][3])
+        elif control_type == '1.3.6.1.4.1.4203.1.9.1.2':  # Sync State control as per RFC4533
+            control_resp = decode_sequence(control_value, 0, len(control_value))
+            control_value = dict()
+            control_value['state'] = SYNC_STATE_NAMES[int(control_resp[0][3][0][3])]
+            control_value['entry_uuid'] = bytes(control_resp[0][3][1][3])
+            control_value['cookie'] = bytes(control_resp[0][3][2][3]) if len(control_resp[0][3]) > 2 else None
+        elif control_type == '1.3.6.1.4.1.4203.1.9.1.3':  # Sync Done control as per RFC4533
+            control_resp = decode_sequence(control_value, 0, len(control_value))
+            control_value = dict()
+            control_value['cookie'] = None
+            control_value['refresh_deletes'] = False
+            for r in control_resp[0][3]:
+                if r[2] == 4:  # cookie
+                    control_value['cookie'] = bytes(r[3])
+                elif r[2] == 1:  # refreshDeletes
+                    control_value['refresh_deletes'] = bool(r[3])
         return control_type, {'description': Oids.get(control_type, ''), 'criticality': criticality, 'value': control_value}
 
     @staticmethod
