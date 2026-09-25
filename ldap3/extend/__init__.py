@@ -48,6 +48,7 @@ from .standard.whoAmI import WhoAmI
 from .standard.modifyPassword import ModifyPassword
 from .standard.PagedSearch import paged_search_generator, paged_search_accumulator
 from .standard.PersistentSearch import PersistentSearch
+from .standard.VirtualListView import VLVSearch
 
 
 class ExtendedOperationContainer(object):
@@ -125,6 +126,52 @@ class StandardExtendedOperations(ExtendedOperationContainer):
                                             controls,
                                             paged_size,
                                             paged_criticality)
+
+    def vlv_search(self,
+                   search_base,
+                   search_filter,
+                   sort_keys,
+                   before_count,
+                   after_count=None,
+                   offset=None,
+                   estimated_content_count=0,
+                   assertion_value=None,
+                   greater_than_or_equal=None,
+                   context_id=None,
+                   search_scope=SUBTREE,
+                   dereference_aliases=DEREF_ALWAYS,
+                   attributes=None,
+                   size_limit=0,
+                   time_limit=0,
+                   types_only=False,
+                   get_operational_attributes=False,
+                   controls=None,
+                   sort_criticality=False,
+                   vlv_criticality=False,
+                   timeout=None):
+        vlv = VLVSearch(self._connection,
+                        search_base,
+                        search_filter,
+                        sort_keys,
+                        search_scope,
+                        dereference_aliases,
+                        attributes,
+                        size_limit,
+                        time_limit,
+                        types_only,
+                        get_operational_attributes,
+                        controls,
+                        sort_criticality,
+                        vlv_criticality,
+                        context_id)
+        return vlv.search(before_count,
+                          after_count,
+                          offset,
+                          estimated_content_count,
+                          assertion_value,
+                          greater_than_or_equal,
+                          context_id,
+                          timeout)
 
     def persistent_search(self,
                           search_base='',

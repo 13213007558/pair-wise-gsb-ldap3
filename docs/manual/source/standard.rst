@@ -26,6 +26,16 @@ The extend.standard namespace contains extended operation defined in current RFC
             paged_criticality,
             generator
         )
+        extend.standard.vlv_search(search_base,
+            search_filter,
+            sort_keys,
+            before_count,
+            after_count,
+            offset,
+            estimated_content_count,
+            assertion_value,
+            context_id
+        )
         extend.standard.persistent_search(
             connection,
             search_base,
@@ -76,6 +86,26 @@ a *generator* for the entries.
 If you set to False the generator parameter of the search will be fully executed before returning the results.
 If generator is set to True (the default) any subsequent search will be executed only when you read all the previous
 read entries, saving memory.
+
+The extend.standard.vlv_search() operation combines the Server Side Sort control (RFC 2891) with the Virtual List
+View control to open a window in the middle of an ordered result set. It returns an object with the received entries
+in ``response`` and exposes ``target_position``, ``content_count``, ``context_id``, ``sort_result_code`` and
+``vlv_result_code``. The search result code is independent from the two control result codes.
+
+Use ``offset`` to request a specific position or ``assertion_value`` to locate the first entry at or near an
+attribute value::
+
+    window = c.extend.standard.vlv_search('ou=people,o=test',
+                                          '(objectClass=person)',
+                                          ['sn', ('givenName', True)],
+                                          before_count=2,
+                                          after_count=4,
+                                          offset=51)
+
+The ``content_count`` value is the server's current estimate, not a stable snapshot size. Reuse the returned
+``context_id`` only for follow-up windows of the same base, filter and sort keys; changing any of them starts a new
+VLV context. With an asynchronous strategy call ``get_response()`` on the returned object to collect the entries and
+response metadata.
 
 In the modify_password() extended operation you can specify an hashing algorithm, if your LDAP server use hashed password but don't compute the hash by itself. Otherwise you can send the password and the server will hash it.
 

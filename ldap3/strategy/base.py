@@ -58,6 +58,8 @@ from ..operation.abandon import abandon_request_to_dict
 from ..core.tls import Tls
 from ..protocol.oid import Oids
 from ..protocol.rfc2696 import RealSearchControlValue
+from ..protocol.rfc2891 import SORT_RESPONSE_CONTROL, decode_sort_response
+from ..protocol.virtualListView import VLV_RESPONSE_CONTROL, decode_vlv_response
 from ..protocol.microsoft import DirSyncControlResponseValue
 from ..utils.log import log, log_enabled, ERROR, BASIC, PROTOCOL, NETWORK, EXTENDED, format_ldap_message
 from ..utils.asn1 import encode, decoder, ldap_result_to_dict_fast, decode_sequence
@@ -597,13 +599,19 @@ class BaseStrategy(object):
         """
         control_type = str(control['controlType'])
         criticality = bool(control['criticality'])
-        control_value = bytes(control['controlValue'])
+        control_value = bytes(control['controlValue']) if control['controlValue'].hasValue() else None
         unprocessed = None
-        if control_type == '1.2.840.113556.1.4.319':  # simple paged search as per RFC2696
+        if control_value is None:
+            pass
+        elif control_type == '1.2.840.113556.1.4.319':  # simple paged search as per RFC2696
             control_resp, unprocessed = decoder.decode(control_value, asn1Spec=RealSearchControlValue())
             control_value = dict()
             control_value['size'] = int(control_resp['size'])
             control_value['cookie'] = bytes(control_resp['cookie'])
+        elif control_type == SORT_RESPONSE_CONTROL:
+            control_value = decode_sort_response(control_value)
+        elif control_type == VLV_RESPONSE_CONTROL:
+            control_value = decode_vlv_response(control_value)
         elif control_type == '1.2.840.113556.1.4.841':  # DirSync AD
             control_resp, unprocessed = decoder.decode(control_value, asn1Spec=DirSyncControlResponseValue())
             control_value = dict()
@@ -638,6 +646,22 @@ class BaseStrategy(object):
             control_value = dict()
             control_value['size'] = int(control_resp[0][3][0][3])
             control_value['cookie'] = bytes(control_resp[0][3][1][3])
+        elif control_type == SORT_RESPONSE_CONTROL:
+            control_resp = decode_sequence(control_value, 0, len(control_value))
+            fields = control_resp[0][3]
+            control_value = {
+                'result': int(fields[0][3]),
+                'attribute_type': fields[1][3].decode('utf-8') if len(fields) > 1 else None
+            }
+        elif control_type == VLV_RESPONSE_CONTROL:
+            control_resp = decode_sequence(control_value, 0, len(control_value))
+            fields = control_resp[0][3]
+            control_value = {
+                'target_position': int(fields[0][3]),
+                'content_count': int(fields[1][3]),
+                'result': int(fields[2][3]),
+                'context_id': bytes(fields[3][3]) if len(fields) > 3 else None
+            }
         elif control_type == '1.2.840.113556.1.4.841':  # DirSync AD
             control_resp = decode_sequence(control_value, 0, len(control_value))
             control_value = dict()
