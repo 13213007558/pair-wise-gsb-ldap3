@@ -120,7 +120,7 @@ Please refer to the SSLTLS section for more information.
 SASL
 ----
 
-Three SASL mechanisms are currently implemented in the ldap3 library: EXTERNAL, DIGEST-MD5, GSSAPI (Kerberos, via the gssapi package) and PLAIN. DIGEST-MD5 is
+The SASL mechanisms currently implemented in the ldap3 library are: EXTERNAL, DIGEST-MD5, GSSAPI (Kerberos, via the gssapi package), PLAIN, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS (with TLS channel binding, as per RFC 5802/7677). DIGEST-MD5 is
 implemented even if it is **deprecated** and moved to historic (RFC6331, July 2011) because it is **"insecure and unsuitable for use in protocols"**
 (as stated by the RFC).
 

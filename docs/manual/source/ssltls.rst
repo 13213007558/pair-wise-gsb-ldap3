@@ -64,7 +64,7 @@ ssl wrapped socket mechanism.
 SASL
 ----
 
-Three SASL mechanisms are currently implemented in the ldap3 library: EXTERNAL, DIGEST-MD5 and GSSAPI (Kerberos, via the gssapi package). Even if DIGEST-MD5 is **deprecated** and moved to historic (RFC6331, July 2011)
+The SASL mechanisms currently implemented in the ldap3 library are: EXTERNAL, DIGEST-MD5, GSSAPI (Kerberos, via the gssapi package), PLAIN, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS. Even if DIGEST-MD5 is **deprecated** and moved to historic (RFC6331, July 2011)
 because it is **insecure and unsuitable for use in protocols** (as stated by the RFC) I've developed the authentication phase of the protocol because it is still used in LDAP servers.
 
 External
@@ -113,6 +113,34 @@ LDAP encryption is a way to prevent eavesdropping, it is especially useful to se
 
 
 **Using DIGEST-MD5 without LDAP signing is deprecated and should not be used.**
+
+SCRAM-SHA-256
+^^^^^^^^^^^^^
+
+To use the SCRAM-SHA-256 mechanism (RFC 5802 and RFC 7677) you must pass a 2-value or 3-value tuple as sasl_credentials: (username, password, authz_id). You can omit 'authz_id' or pass None if not used::
+
+    from ldap3 import Server, Connection, SASL, SCRAM_SHA_256
+    server = Server(host = test_server, port = test_port)
+    c = Connection(server, auto_bind = True, version = 3, client_strategy = test_strategy, authentication = SASL,
+                   sasl_mechanism = SCRAM_SHA_256, sasl_credentials = ('username', 'password'))
+
+The client verifies the server signature sent in the server-final-message, so a successful LDAP result alone is never
+enough to consider the authentication complete.
+
+SCRAM-SHA-256-PLUS
+^^^^^^^^^^^^^^^^^^
+
+SCRAM-SHA-256-PLUS adds TLS channel binding (RFC 5929) to the SCRAM exchange. You must explicitly select the channel
+binding type in sasl_credentials: (username, password, channel_binding_type, authz_id). 'authz_id' can be omitted or
+None. Supported channel binding types are 'tls-server-end-point' and 'tls-unique'::
+
+    from ldap3 import Server, Connection, SASL, SCRAM_SHA_256_PLUS
+    server = Server(host = test_server, port = test_port_ssl, use_ssl = True, tls = tls)
+    c = Connection(server, auto_bind = True, version = 3, client_strategy = test_strategy, authentication = SASL,
+                   sasl_mechanism = SCRAM_SHA_256_PLUS, sasl_credentials = ('username', 'password', 'tls-server-end-point'))
+
+If the TLS layer cannot provide the selected channel binding data the bind fails; it never silently downgrades to the
+plain SCRAM-SHA-256 mechanism. The 'tls-server-end-point' binding type requires the cryptography package.
 
 Using certificate authentication with Microsoft Active Directory
 ================================================================

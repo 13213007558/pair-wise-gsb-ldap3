@@ -494,6 +494,22 @@ class LDAPSASLBindInProgressError(LDAPExceptionError):
     pass
 
 
+class LDAPScramError(LDAPExceptionError):
+    pass
+
+
+class LDAPScramServerError(LDAPScramError):
+    pass
+
+
+class LDAPScramVerificationError(LDAPScramError):
+    pass
+
+
+class LDAPScramChannelBindingError(LDAPScramError):
+    pass
+
+
 class LDAPMetricsError(LDAPExceptionError):
     pass
 

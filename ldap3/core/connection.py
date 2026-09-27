@@ -32,7 +32,7 @@ from .. import ANONYMOUS, SIMPLE, SASL, MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLAC
     SUBTREE, ASYNC, SYNC, NO_ATTRIBUTES, ALL_ATTRIBUTES, ALL_OPERATIONAL_ATTRIBUTES, MODIFY_INCREMENT, LDIF, ASYNC_STREAM, \
     RESTARTABLE, ROUND_ROBIN, REUSABLE, AUTO_BIND_DEFAULT, AUTO_BIND_NONE, AUTO_BIND_TLS_BEFORE_BIND, SAFE_SYNC, SAFE_RESTARTABLE, \
     AUTO_BIND_TLS_AFTER_BIND, AUTO_BIND_NO_TLS, STRING_TYPES, SEQUENCE_TYPES, MOCK_SYNC, MOCK_ASYNC, NTLM, EXTERNAL,\
-    DIGEST_MD5, GSSAPI, PLAIN, DSA, SCHEMA, ALL, TLS_CHANNEL_BINDING, ENCRYPT
+    DIGEST_MD5, GSSAPI, PLAIN, SCRAM_SHA_256, SCRAM_SHA_256_PLUS, DSA, SCHEMA, ALL, TLS_CHANNEL_BINDING, ENCRYPT
 from .results import RESULT_SUCCESS, RESULT_COMPARE_TRUE, RESULT_COMPARE_FALSE
 from ..extend import ExtendedOperationsRoot
 from .pooling import ServerPool
@@ -50,6 +50,7 @@ from ..protocol.rfc2849 import operation_to_ldif, add_ldif_header
 from ..protocol.sasl.digestMd5 import sasl_digest_md5
 from ..protocol.sasl.external import sasl_external
 from ..protocol.sasl.plain import sasl_plain
+from ..protocol.sasl.scram import sasl_scram_sha_256, sasl_scram_sha_256_plus
 from ..strategy.sync import SyncStrategy
 from ..strategy.safeSync import SafeSyncStrategy
 from ..strategy.safeRestartable import SafeRestartableStrategy
@@ -78,7 +79,9 @@ from ..utils.port_validators import check_port_and_port_list
 SASL_AVAILABLE_MECHANISMS = [EXTERNAL,
                              DIGEST_MD5,
                              GSSAPI,
-                             PLAIN]
+                             PLAIN,
+                             SCRAM_SHA_256,
+                             SCRAM_SHA_256_PLUS]
 
 CLIENT_STRATEGIES = [SYNC,
                      SAFE_SYNC,
@@ -150,7 +153,7 @@ class Connection(object):
     :type client_strategy: can be one of SYNC, ASYNC, LDIF, RESTARTABLE, REUSABLE as specified in ldap3
     :param auto_referrals: specify if the connection object must automatically follow referrals
     :type auto_referrals: bool
-    :param sasl_mechanism: mechanism for SASL authentication, can be one of 'EXTERNAL', 'DIGEST-MD5', 'GSSAPI', 'PLAIN'
+    :param sasl_mechanism: mechanism for SASL authentication, can be one of 'EXTERNAL', 'DIGEST-MD5', 'GSSAPI', 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-256-PLUS'
     :type sasl_mechanism: str
     :param sasl_credentials: credentials for SASL mechanism
     :type sasl_credentials: tuple
@@ -507,6 +510,12 @@ class Connection(object):
         r += '' if self.sasl_mechanism is None else ', sasl_mechanism={0.sasl_mechanism!r}'.format(self)
         if self.sasl_mechanism == DIGEST_MD5:
             r += '' if self.sasl_credentials is None else ", sasl_credentials=({0!r}, {1!r}, '{2}', {3!r})".format(self.sasl_credentials[0], self.sasl_credentials[1], '*' * len(self.sasl_credentials[2]), self.sasl_credentials[3])
+        elif self.sasl_mechanism in (SCRAM_SHA_256, SCRAM_SHA_256_PLUS):
+            if self.sasl_credentials is None:
+                pass
+            else:
+                masked_credentials = tuple(('*' * len(credential) if index == 1 and credential else credential) for index, credential in enumerate(self.sasl_credentials))
+                r += ', sasl_credentials={0!r}'.format(masked_credentials)
         else:
             r += '' if self.sasl_credentials is None else ', sasl_credentials={0.sasl_credentials!r}'.format(self)
         r += '' if self.check_names is None else ', check_names={0.check_names!r}'.format(self)
@@ -1377,6 +1386,10 @@ class Connection(object):
                         result = sasl_gssapi(self, controls)
                     elif self.sasl_mechanism == 'PLAIN':
                         result = sasl_plain(self, controls)
+                    elif self.sasl_mechanism == SCRAM_SHA_256:
+                        result = sasl_scram_sha_256(self, controls)
+                    elif self.sasl_mechanism == SCRAM_SHA_256_PLUS:
+                        result = sasl_scram_sha_256_plus(self, controls)
                 finally:
                     self.sasl_in_progress = False
 
