@@ -181,6 +181,7 @@ class MockBaseStrategy(object):
     def _stop_listen(self):
         self.connection.listening = False
         self.connection.closed = True
+        self.bound = None  # closing the association drops the authenticated identity
         if self.connection.usage:
             self.connection._usage.closed_sockets += 1
 
@@ -298,6 +299,10 @@ class MockBaseStrategy(object):
         #
         # request: version, name, authentication
         # response: LDAPResult + serverSaslCreds
+        # as per RFC 4511 (4.2.1) and RFC 4513 (5.1) any bind attempt resets the
+        # association to the anonymous state, so the previous identity is dropped
+        # before evaluating the credentials and kept only if the bind succeeds
+        self.bound = None
         request = bind_request_to_dict(request_message)
         identity = request['name']
         if 'simple' in request['authentication']:
@@ -745,6 +750,9 @@ class MockBaseStrategy(object):
         message = 'not implemented'
         response_name = None
         response_value = None
+        # as per RFC 4532 an anonymous (or not yet bound) association has an empty
+        # authorization identity, so the '<anonymous>' sentinel and None both map to ''
+        bound_identity = self.bound if self.bound and self.bound != '<anonymous>' else ''
         if self.connection.server.info:
             for extension in self.connection.server.info.supported_extensions:
                 if request['name'] == extension[0]:  # server can answer the extended request
@@ -752,12 +760,12 @@ class MockBaseStrategy(object):
                         result_code = 0
                         message = ''
                         response_name = OctetString('2.16.840.1.113719.1.27.100.32')  # getBindDNResponse [NOVELL]
-                        response_value = OctetString(self.bound)
+                        response_value = OctetString(bound_identity)
                     elif extension[0] == '1.3.6.1.4.1.4203.1.11.3':  # WhoAmI [RFC4532]
                         result_code = 0
                         message = ''
                         response_name = OctetString('1.3.6.1.4.1.4203.1.11.3')  # WhoAmI [RFC4532]
-                        response_value = OctetString(self.bound)
+                        response_value = OctetString(bound_identity)
                     break
 
         return {'resultCode': result_code,
