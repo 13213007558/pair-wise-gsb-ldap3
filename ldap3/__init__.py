@@ -145,6 +145,7 @@ from .version import __author__, __version__, __email__, __description__, __stat
 from .utils.config import get_config_parameter, set_config_parameter
 from .core.server import Server
 from .core.connection import Connection
+from .core.referral import ReferralCredentialPolicy, DefaultReferralCredentialPolicy, REFERRAL_CREDENTIALS_DENY, REFERRAL_CREDENTIALS_ANONYMOUS, REFERRAL_CREDENTIALS_ALLOW
 from .core.tls import Tls
 from .core.pooling import ServerPool
 from .core.rdns import ReverseDnsSetting

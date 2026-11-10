@@ -19,6 +19,19 @@ The Server object specifies the DSA (Directory Server Agent) LDAP server that wi
 
     * allow_auth is a boolean to indicate if authentication to that server is allowed; if False only anonymous bind will be used.
 
+* referral_credential_policy: a ReferralCredentialPolicy object that decides, for each referral target, whether the referral
+  must be refused (REFERRAL_CREDENTIALS_DENY), followed with an anonymous bind (REFERRAL_CREDENTIALS_ANONYMOUS) or followed
+  passing the credentials of the original connection (REFERRAL_CREDENTIALS_ALLOW). The policy receives the original
+  Connection and a description of the target (scheme, host, port, ssl flag and the authentication context of the original
+  connection) and covers SIMPLE, SASL and anonymous connections. It defaults to None, meaning the
+  DefaultReferralCredentialPolicy is used: it honours allowed_referral_hosts (a host allowed only without authentication
+  is followed anonymously) and never sends credentials when the channel is downgraded from TLS (ldaps) to cleartext ldap.
+  When a custom policy is supplied it takes precedence over the allow_auth flag of allowed_referral_hosts for the
+  credential decision, while allowed_referral_hosts still defines which referral hosts can be followed at all.
+  Referral connections kept in the referral cache (use_referral_cache=True) are reused only when the current policy
+  decision matches the one the cached connection was created with, so a connection cached with credentials is never
+  reused as an anonymous connection (or vice versa) after a configuration change.
+
 * get_info: specifies if the server schema and server specific info must be read (defaults to SCHEMA). Possible values are:
 
     * NONE: no information is gathered from the server

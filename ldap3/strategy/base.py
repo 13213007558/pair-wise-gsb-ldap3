@@ -36,6 +36,7 @@ from random import choice
 
 from .. import SYNC, ANONYMOUS, get_config_parameter, BASE, ALL_ATTRIBUTES, ALL_OPERATIONAL_ATTRIBUTES, NO_ATTRIBUTES, DIGEST_MD5, ENCRYPT, NTLM, GSSAPI
 from ..core.results import DO_NOT_RAISE_EXCEPTIONS, RESULT_REFERRAL
+from ..core.referral import DefaultReferralCredentialPolicy, REFERRAL_CREDENTIALS_ALLOW, REFERRAL_CREDENTIALS_DENY
 from ..core.exceptions import LDAPOperationResult, LDAPSASLBindInProgressError, LDAPSocketOpenError, LDAPSessionTerminatedByServerError,\
     LDAPUnknownResponseError, LDAPUnknownRequestError, LDAPReferralError, communication_exception_factory, LDAPStartTLSError, \
     LDAPSocketSendError, LDAPExceptionError, LDAPControlError, LDAPResponseTimeoutError, LDAPTransactionError
@@ -766,32 +767,51 @@ class BaseStrategy(object):
             selected_referral = choice(preferred_referral_list) if preferred_referral_list else choice(
                 valid_referral_list)
 
-            cachekey = (selected_referral['host'], selected_referral['port'] or self.connection.server.port, selected_referral['ssl'])
+            selected_referral['scheme'] = 'ldaps' if selected_referral['ssl'] else 'ldap'
+            selected_referral['port'] = selected_referral['port'] or self.connection.server.port
+            selected_referral['authentication'] = self.connection.authentication
+            selected_referral['sasl_mechanism'] = self.connection.sasl_mechanism
+
+            referral_credential_policy = self.connection.server.referral_credential_policy or DefaultReferralCredentialPolicy()
+            credential_decision = referral_credential_policy.decide(self.connection, selected_referral)
+            if credential_decision == REFERRAL_CREDENTIALS_DENY:
+                error = 'referral to {0[scheme]}://{0[host]}:{0[port]} denied by referral credential policy'.format(selected_referral)
+                if log_enabled(ERROR):
+                    log(ERROR, '%s for <%s>', error, self.connection)
+                self.connection.last_error = error
+                raise LDAPReferralError(error)
+
+            pass_credentials = credential_decision == REFERRAL_CREDENTIALS_ALLOW
+            self._referrals.append(selected_referral['host'])  # track followed referrals to detect loops
+
+            cachekey = (selected_referral['host'], selected_referral['port'], selected_referral['ssl'], credential_decision)
             if self.connection.use_referral_cache and cachekey in self.referral_cache:
                 referral_connection = self.referral_cache[cachekey]
             else:
                 referral_server = Server(host=selected_referral['host'],
-                                         port=selected_referral['port'] or self.connection.server.port,
+                                         port=selected_referral['port'],
                                          use_ssl=selected_referral['ssl'],
                                          get_info=self.connection.server.get_info,
                                          formatter=self.connection.server.custom_formatter,
                                          connect_timeout=self.connection.server.connect_timeout,
                                          mode=self.connection.server.mode,
                                          allowed_referral_hosts=self.connection.server.allowed_referral_hosts,
-                                         tls=Tls(local_private_key_file=self.connection.server.tls.private_key_file,
+                                         referral_credential_policy=self.connection.server.referral_credential_policy,
+                                         tls=(Tls(local_private_key_file=self.connection.server.tls.private_key_file,
                                                  local_certificate_file=self.connection.server.tls.certificate_file,
                                                  validate=self.connection.server.tls.validate,
                                                  version=self.connection.server.tls.version,
                                                  ca_certs_file=self.connection.server.tls.ca_certs_file) if
+                                         self.connection.server.tls else Tls()) if
                                          selected_referral['ssl'] else None)
 
                 from ..core.connection import Connection
 
                 referral_connection = Connection(server=referral_server,
-                                                 user=self.connection.user if not selected_referral['anonymousBindOnly'] else None,
-                                                 password=self.connection.password if not selected_referral['anonymousBindOnly'] else None,
+                                                 user=self.connection.user if pass_credentials else None,
+                                                 password=self.connection.password if pass_credentials else None,
                                                  version=self.connection.version,
-                                                 authentication=self.connection.authentication if not selected_referral['anonymousBindOnly'] else ANONYMOUS,
+                                                 authentication=self.connection.authentication if pass_credentials else ANONYMOUS,
                                                  client_strategy=SYNC,
                                                  auto_referrals=True,
                                                  read_only=self.connection.read_only,
@@ -799,8 +819,8 @@ class BaseStrategy(object):
                                                  raise_exceptions=self.connection.raise_exceptions,
                                                  fast_decoder=self.connection.fast_decoder,
                                                  receive_timeout=self.connection.receive_timeout,
-                                                 sasl_mechanism=self.connection.sasl_mechanism,
-                                                 sasl_credentials=self.connection.sasl_credentials)
+                                                 sasl_mechanism=self.connection.sasl_mechanism if pass_credentials else None,
+                                                 sasl_credentials=self.connection.sasl_credentials if pass_credentials else None)
 
                 if self.connection.usage:
                     self.connection._usage.referrals_connections += 1
@@ -812,7 +832,7 @@ class BaseStrategy(object):
                         error = 'start_tls in referral not successful' + (' - ' + referral_connection.last_error if referral_connection.last_error else '')
                         if log_enabled(ERROR):
                             log(ERROR, '%s for <%s>', error, self)
-                        self.unbind()
+                        referral_connection.unbind()
                         raise LDAPStartTLSError(error)
 
                 if self.connection.bound:

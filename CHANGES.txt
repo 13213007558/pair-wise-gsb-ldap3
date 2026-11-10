@@ -2,6 +2,12 @@
     - fixed IndexError in auto_range search when response has no ranged attributes
     - fixed TypeError in format_ad_timedelta with malformed AD timestamps
     - Allow empty base for mocks
+    - added referral_credential_policy to Server: a ReferralCredentialPolicy decides for each referral target if the referral is denied, followed anonymously or followed with the original connection credentials (SIMPLE, SASL and ANONYMOUS covered); defaults to DefaultReferralCredentialPolicy which honours allowed_referral_hosts and never sends credentials over a channel downgraded from TLS to cleartext
+    - SASL credentials are no longer copied to referral connections bound anonymously
+    - referral cache entries are keyed by the credential policy decision, so a cached connection is never reused under a different credential decision after a configuration change
+    - fixed referral loop detection: followed referral hosts are now tracked across hops
+    - fixed AttributeError when following an ldaps referral from a connection without a Tls object
+    - fixed referral start_tls failure unbinding the original connection instead of the failed referral connection
 
 # 2.10.2rc3 . 2025.04.19
     - tested against Python 3.13

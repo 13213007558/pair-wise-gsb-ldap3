@@ -65,6 +65,14 @@ class Server(object):
     Per RFC 4516. Use [('*', False)] to allow any host with anonymous
     bind, use [('*', True)] to allow any host with same authentication of
     Server.
+
+    Referral_credential_policy can be None (default) or a
+    ReferralCredentialPolicy object that decides, for each referral
+    target, if the referral must be refused, followed anonymously or
+    followed passing the credentials of the original connection. When
+    None the DefaultReferralCredentialPolicy is used; it honours
+    allowed_referral_hosts and never sends credentials over a channel
+    downgraded from TLS to cleartext.
     """
 
     _message_counter = 0
@@ -80,7 +88,8 @@ class Server(object):
                  formatter=None,
                  connect_timeout=None,
                  mode=IP_V6_PREFERRED,
-                 validator=None):
+                 validator=None,
+                 referral_credential_policy=None):
 
         self.ipc = False
         url_given = False
@@ -170,6 +179,13 @@ class Server(object):
         else:
             self.allowed_referral_hosts = []
 
+        if referral_credential_policy is not None and not callable(getattr(referral_credential_policy, 'decide', None)):
+            if log_enabled(ERROR):
+                log(ERROR, 'invalid referral credential policy: <%s>', referral_credential_policy)
+            raise LDAPDefinitionError('referral_credential_policy must be a ReferralCredentialPolicy object')
+
+        self.referral_credential_policy = referral_credential_policy
+
         self.ssl = True if use_ssl else False
         if tls and not isinstance(tls, Tls):
             if log_enabled(ERROR):
@@ -221,6 +237,7 @@ class Server(object):
     def __repr__(self):
         r = 'Server(host={0.host!r}, port={0.port!r}, use_ssl={0.ssl!r}'.format(self)
         r += '' if not self.allowed_referral_hosts else ', allowed_referral_hosts={0.allowed_referral_hosts!r}'.format(self)
+        r += '' if self.referral_credential_policy is None else ', referral_credential_policy={0.referral_credential_policy!r}'.format(self)
         r += '' if self.tls is None else ', tls={0.tls!r}'.format(self)
         r += '' if not self.get_info else ', get_info={0.get_info!r}'.format(self)
         r += '' if not self.connect_timeout else ', connect_timeout={0.connect_timeout!r}'.format(self)
