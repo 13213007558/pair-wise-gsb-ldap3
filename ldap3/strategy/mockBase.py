@@ -29,8 +29,9 @@ import re
 from random import SystemRandom
 
 from pyasn1.type.univ import OctetString
+from pyasn1.error import PyAsn1Error
 
-from .. import SEQUENCE_TYPES, ALL_ATTRIBUTES
+from .. import SEQUENCE_TYPES, ALL_ATTRIBUTES, ALL_OPERATIONAL_ATTRIBUTES, NO_ATTRIBUTES
 from ..operation.bind import bind_request_to_dict
 from ..operation.delete import delete_request_to_dict
 from ..operation.add import add_request_to_dict
@@ -38,25 +39,28 @@ from ..operation.compare import compare_request_to_dict
 from ..operation.modifyDn import modify_dn_request_to_dict
 from ..operation.modify import modify_request_to_dict
 from ..operation.extended import extended_request_to_dict
-from ..operation.search import search_request_to_dict, parse_filter, ROOT, AND, OR, NOT, MATCH_APPROX, \
+from ..operation.search import search_request_to_dict, parse_filter, FilterNode, ROOT, AND, OR, NOT, MATCH_APPROX, \
     MATCH_GREATER_OR_EQUAL, MATCH_LESS_OR_EQUAL, MATCH_EXTENSIBLE, MATCH_PRESENT,\
     MATCH_SUBSTRING, MATCH_EQUAL
 from ..utils.conv import json_hook, to_unicode, to_raw
 from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
-    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
+    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN, \
+    RESULT_ASSERTION_FAILED
 from ..utils.ciDict import CaseInsensitiveDict
 from ..utils.dn import to_dn, safe_dn, safe_rdn
 from ..protocol.sasl.sasl import validate_simple_password
 from ..protocol.formatters.standard import find_attribute_validator, format_attribute_values
 from ..protocol.rfc2696 import paged_search_control
 from ..utils.log import log, log_enabled, ERROR, BASIC
-from ..utils.asn1 import encode
+from ..utils.asn1 import encode, decoder
 from ..utils.conv import ldap_escape_to_bytes
 from ..strategy.base import BaseStrategy  # needed for decode_control() method
-from ..protocol.rfc4511 import LDAPMessage, ProtocolOp, MessageID
+from ..protocol.rfc4511 import LDAPMessage, ProtocolOp, MessageID, Filter, AttributeSelection, SearchResultEntry, \
+    PartialAttributeList, PartialAttribute, AttributeDescription, Vals, AttributeValue, LDAPDN
 from ..protocol.convert import build_controls_list
+from ..protocol.controls import build_control
 
 
 # LDAPResult ::= SEQUENCE {
@@ -116,6 +120,13 @@ from ..protocol.convert import build_controls_list
 
 SEARCH_CONTROLS = ['1.2.840.113556.1.4.319'  # simple paged search [RFC 2696]
                    ]
+MODIFY_CONTROLS = ['1.3.6.1.1.12',  # assertion [RFC 4528]
+                   '1.3.6.1.1.13.1',  # pre-read [RFC 4527]
+                   '1.3.6.1.1.13.2'  # post-read [RFC 4527]
+                   ]
+ASSERTION_CONTROL = '1.3.6.1.1.12'
+PRE_READ_CONTROL = '1.3.6.1.1.13.1'
+POST_READ_CONTROL = '1.3.6.1.1.13.2'
 SERVER_ENCODING = 'utf-8'
 
 
@@ -504,9 +515,80 @@ class MockBaseStrategy(object):
         result_code = 0
         message = ''
         rdns = [rdn[0] for rdn in safe_rdn(dn, decompose=True)]
-        if dn in self.connection.server.dit:
+
+        # request controls are decoded and validated before the DIT is touched,
+        # so a malformed or unsupported control never leaves a partial modification behind
+        assertion_filter = None
+        pre_read_attributes = None
+        post_read_attributes = None
+        if controls:
+            seen_controls = set()
+            for control in controls:
+                if not control:
+                    continue
+                control_type = str(control['controlType'])
+                criticality = bool(control['criticality'])
+                if control_type in seen_controls:
+                    message = 'duplicate control ' + control_type + ' in modify request'
+                    return {'resultCode': RESULT_PROTOCOL_ERROR,
+                            'matchedDN': '',
+                            'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                            'referral': None
+                            }
+                seen_controls.add(control_type)
+                if control_type not in MODIFY_CONTROLS:
+                    if criticality:
+                        message = 'Critical requested control ' + control_type + ' not available'
+                        return {'resultCode': RESULT_UNAVAILABLE_CRITICAL_EXTENSION,
+                                'matchedDN': '',
+                                'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                                'referral': None
+                                }
+                    continue  # unrecognized non-critical controls are ignored
+                control_value = bytes(control['controlValue'])
+                try:
+                    if control_type == ASSERTION_CONTROL:  # AssertionControlValue ::= AssertionFilter (a search filter) [RFC 4528]
+                        assertion_filter, unprocessed = decoder.decode(control_value, asn1Spec=Filter())
+                    else:  # PreReadControlValue/PostReadControlValue ::= AttributeSelection [RFC 4527]
+                        attribute_selection, unprocessed = decoder.decode(control_value, asn1Spec=AttributeSelection())
+                        if control_type == PRE_READ_CONTROL:
+                            pre_read_attributes = [str(selector) for selector in attribute_selection]
+                        else:
+                            post_read_attributes = [str(selector) for selector in attribute_selection]
+                    if unprocessed:
+                        raise PyAsn1Error('unprocessed substrate in control value')
+                except PyAsn1Error:
+                    message = 'unable to decode value of control ' + control_type
+                    return {'resultCode': RESULT_PROTOCOL_ERROR,
+                            'matchedDN': '',
+                            'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                            'referral': None
+                            }
+
+        pre_read_values = None
+        post_read_values = None
+        with self.connection.server.dit_lock:  # assertion check, modification and pre/post-read are a single atomic step
+            if dn not in self.connection.server.dit:
+                return {'resultCode': RESULT_NO_SUCH_OBJECT,
+                        'matchedDN': '',
+                        'diagnosticMessage': to_unicode('object not found', SERVER_ENCODING),
+                        'referral': None
+                        }
+            if assertion_filter is not None:  # the assertion is evaluated against the entry before any change is made
+                filter_root = FilterNode(ROOT)
+                filter_root.append(self._compiled_filter_to_node(assertion_filter))
+                if dn not in self.evaluate_filter_node(filter_root, [dn]):
+                    return {'resultCode': RESULT_ASSERTION_FAILED,
+                            'matchedDN': '',
+                            'diagnosticMessage': to_unicode('assertion failed', SERVER_ENCODING),
+                            'referral': None
+                            }
             entry = self.connection.server.dit[dn]
             original_entry = entry.copy()  # to preserve atomicity of operation
+            for attribute in original_entry:  # deep copies the values so that in-place changes can be rolled back
+                original_entry[attribute] = list(original_entry[attribute])
+            if pre_read_attributes is not None:
+                pre_read_values = self._read_entry_attributes(dn, pre_read_attributes)
             for modification in changes:
                 operation = modification['operation']
                 attribute = modification['attribute']['type']
@@ -574,17 +656,107 @@ class MockBaseStrategy(object):
                                 result_code = RESULT_UNWILLING_TO_PERFORM
                                 message = 'unable to increment value'
 
-            if result_code:  # an error has happened, restores the original dn
+            if result_code:  # an error has happened, restores the original entry
                 self.connection.server.dit[dn] = original_entry
-        else:
-            result_code = RESULT_NO_SUCH_OBJECT
-            message = 'object not found'
+            elif post_read_attributes is not None:
+                post_read_values = self._read_entry_attributes(dn, post_read_attributes)
 
-        return {'resultCode': result_code,
-                'matchedDN': '',
-                'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
-                'referral': None
-                }
+        result = {'resultCode': result_code,
+                  'matchedDN': '',
+                  'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                  'referral': None
+                  }
+        if not result_code:  # pre-read and post-read response controls are returned only when the modification succeeds [RFC 4527]
+            response_controls = []
+            if pre_read_attributes is not None:
+                response_controls.append(self._build_read_control(PRE_READ_CONTROL, dn, pre_read_values))
+            if post_read_attributes is not None:
+                response_controls.append(self._build_read_control(POST_READ_CONTROL, dn, post_read_values))
+            if response_controls:
+                result['controls'] = [BaseStrategy.decode_control(response_control) for response_control in response_controls]
+
+        return result
+
+    @staticmethod
+    def _compiled_filter_to_node(compiled_filter):
+        """Converts an ASN.1 Filter (as decoded from an assertion control value) to a FilterNode tree
+        that can be evaluated by evaluate_filter_node()"""
+        filter_type = compiled_filter.getName()
+        component = compiled_filter.getComponent()
+        if filter_type == 'and':
+            node = FilterNode(AND)
+            for sub_filter in component:
+                node.append(MockBaseStrategy._compiled_filter_to_node(sub_filter))
+        elif filter_type == 'or':
+            node = FilterNode(OR)
+            for sub_filter in component:
+                node.append(MockBaseStrategy._compiled_filter_to_node(sub_filter))
+        elif filter_type == 'notFilter':
+            node = FilterNode(NOT)
+            node.append(MockBaseStrategy._compiled_filter_to_node(component['innerNotFilter']))
+        elif filter_type == 'equalityMatch':
+            node = FilterNode(MATCH_EQUAL, {'attr': str(component['attributeDesc']), 'value': bytes(component['assertionValue'])})
+        elif filter_type == 'approxMatch':
+            node = FilterNode(MATCH_APPROX, {'attr': str(component['attributeDesc']), 'value': bytes(component['assertionValue'])})
+        elif filter_type == 'greaterOrEqual':
+            node = FilterNode(MATCH_GREATER_OR_EQUAL, {'attr': str(component['attributeDesc']), 'value': bytes(component['assertionValue'])})
+        elif filter_type == 'lessOrEqual':
+            node = FilterNode(MATCH_LESS_OR_EQUAL, {'attr': str(component['attributeDesc']), 'value': bytes(component['assertionValue'])})
+        elif filter_type == 'present':
+            node = FilterNode(MATCH_PRESENT, {'attr': str(component)})
+        elif filter_type == 'substringFilter':
+            assertion = {'attr': str(component['type'])}
+            any_substrings = []
+            for substring in component['substrings']:
+                if substring.getName() == 'initial':
+                    assertion['initial'] = bytes(substring.getComponent())
+                elif substring.getName() == 'any':
+                    any_substrings.append(bytes(substring.getComponent()))
+                elif substring.getName() == 'final':
+                    assertion['final'] = bytes(substring.getComponent())
+            if any_substrings:
+                assertion['any'] = any_substrings
+            node = FilterNode(MATCH_SUBSTRING, assertion)
+        elif filter_type == 'extensibleMatch':
+            node = FilterNode(MATCH_EXTENSIBLE, {})  # evaluate_filter_node() rejects extensible match in Mock strategies
+        else:
+            raise LDAPDefinitionError('unknown filter type in assertion control')
+        return node
+
+    def _read_entry_attributes(self, dn, requested_attributes):
+        """Returns a dict with the current raw values of the requested attributes of an entry.
+        Only requested attributes that are allowed to be returned are included:
+        operational attributes are returned only when explicitly requested"""
+        entry = self.connection.server.dit[dn]
+        attributes = dict()
+        requested = [attribute.lower() for attribute in requested_attributes]
+        if NO_ATTRIBUTES in requested:  # '1.1', no attributes must be returned
+            return attributes
+        for attribute in entry:
+            if attribute in self.operational_attributes:
+                if attribute.lower() in requested or ALL_OPERATIONAL_ATTRIBUTES in requested:
+                    attributes[attribute] = list(entry[attribute])
+            elif ALL_ATTRIBUTES in requested or attribute.lower() in requested:
+                attributes[attribute] = list(entry[attribute])
+        return attributes
+
+    @staticmethod
+    def _build_read_control(oid, dn, attributes):
+        """Builds a pre-read/post-read response control, the value is a SearchResultEntry
+        with the entry attributes as per RFC 4527"""
+        search_entry = SearchResultEntry()
+        search_entry['object'] = LDAPDN(dn)
+        partial_attributes = PartialAttributeList()
+        for pos, attribute in enumerate(attributes):
+            partial_attribute = PartialAttribute()
+            partial_attribute['type'] = AttributeDescription(attribute)
+            vals = Vals()
+            for val_pos, value in enumerate(attributes[attribute]):
+                vals.setComponentByPosition(val_pos, AttributeValue(value))
+            partial_attribute['vals'] = vals
+            partial_attributes.setComponentByPosition(pos, partial_attribute)
+        search_entry['attributes'] = partial_attributes
+        return build_control(oid, False, search_entry)
 
     def mock_search(self, request_message, controls):
         # SearchRequest ::= [APPLICATION 3] SEQUENCE {

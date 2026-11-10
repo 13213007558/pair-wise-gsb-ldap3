@@ -89,8 +89,15 @@ def modify_request_to_dict(request):
 
 
 def modify_response_to_dict(response):
-    return {'result': int(response['resultCode']),
+    result = {'result': int(response['resultCode']),
             'description': ResultCode().getNamedValues().getName(response['resultCode']),
             'message': str(response['diagnosticMessage']),
             'dn': str(response['matchedDN']),
             'referrals': referrals_to_list(response['referral'])}
+
+    if 'controls' in response:  # used for returning controls in Mock strategies
+        result['controls'] = dict()
+        for control in response['controls']:
+            result['controls'][control[0]] = control[1]
+
+    return result
