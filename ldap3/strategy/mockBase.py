@@ -42,10 +42,11 @@ from ..operation.search import search_request_to_dict, parse_filter, ROOT, AND, 
     MATCH_GREATER_OR_EQUAL, MATCH_LESS_OR_EQUAL, MATCH_EXTENSIBLE, MATCH_PRESENT,\
     MATCH_SUBSTRING, MATCH_EQUAL
 from ..utils.conv import json_hook, to_unicode, to_raw
-from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
+from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError, LDAPInvalidDnError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
-    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
+    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN, \
+    RESULT_INVALID_DN_SYNTAX, RESULT_LOOP_DETECTED
 from ..utils.ciDict import CaseInsensitiveDict
 from ..utils.dn import to_dn, safe_dn, safe_rdn
 from ..protocol.sasl.sasl import validate_simple_password
@@ -428,6 +429,110 @@ class MockBaseStrategy(object):
                 'referral': None
                 }
 
+    @staticmethod
+    def _dn_ends_with(dn, suffix):
+        """True if the (already escaped) dn is the same entry as suffix or has it as a superior component."""
+        if not suffix:
+            return False
+        if dn == suffix:
+            return True
+        return dn.lower().endswith(',' + suffix.lower())
+
+    def _subtree_dns(self, dn):
+        """Returns the DN of the entry itself and the DNs of every entry beneath it, deepest first."""
+        descendants = [entry_dn for entry_dn in self.connection.server.dit if self._dn_ends_with(entry_dn, dn)]
+        descendants.sort(key=lambda entry_dn: entry_dn.count(','), reverse=True)
+        return descendants
+
+    @staticmethod
+    def _rebase_dn(entry_dn, old_base, new_base):
+        """Replaces the old_base suffix of an entry DN with new_base. Entries are compared case-insensitively."""
+        if entry_dn.lower() == old_base.lower():
+            return new_base
+        prefix = entry_dn[:-(len(old_base) + 1)]  # drops the comma separating the entry from its base
+        return prefix + ',' + new_base
+
+    def _apply_rdn_attributes(self, entry, new_rdn, delete_old_rdn, old_rdn):
+        """Updates the attribute values of the moved entry following the RDN semantics of RFC 4514/4511.
+
+        The values of the new RDN are added to the entry attributes; when deleteOldRdn is true the values
+        used only by the old RDN are removed. Multi-valued RDNs (the '+' separator) are handled AVA by AVA,
+        so a value shared by the old and new RDN is always kept.
+        """
+        old_avas = safe_rdn(old_rdn, decompose=True)
+        new_avas = safe_rdn(new_rdn, decompose=True)
+        new_values_by_attribute = CaseInsensitiveDict()
+        for attribute_type, value in new_avas:
+            new_values_by_attribute.setdefault(attribute_type, []).append(to_raw(value))
+
+        # deletes the old RDN values first, keeping every value still referenced by the new RDN
+        if delete_old_rdn:
+            new_attribute_names = [attribute_type for attribute_type, _ in new_avas]
+            for attribute_type, value in old_avas:
+                raw_value = to_raw(value)
+                if attribute_type in new_attribute_names and raw_value in new_values_by_attribute[attribute_type]:
+                    continue  # the value is part of the new RDN, cannot be deleted
+                if attribute_type in entry and raw_value in entry[attribute_type]:
+                    entry[attribute_type].remove(raw_value)
+                    if not entry[attribute_type]:
+                        del entry[attribute_type]
+
+        # adds the new RDN values, creating the attribute when missing (mirrors add_entry behaviour)
+        for attribute_type, value in new_avas:
+            raw_value = to_raw(value)
+            if attribute_type not in entry:
+                entry[attribute_type] = [raw_value]
+            elif raw_value not in entry[attribute_type]:
+                entry[attribute_type].append(raw_value)
+
+    def _commit_modify_dn(self, target_dn, new_target_dn, new_rdn, delete_old_rdn):
+        """Performs the subtree move. Builds the whole new tree first and swaps it in a single step.
+
+        A shallow backup of the affected entries is kept so that any failure while writing the new tree
+        leaves the DIT and every attribute byte-for-byte as it was before the operation.
+        """
+        affected_dns = self._subtree_dns(target_dn)
+        old_rdn = to_dn(target_dn)[0]
+        # pre-compute the moved entries on independent copies, the live DIT is not touched yet
+        moved = {}
+        for entry_dn in affected_dns:
+            new_dn = self._rebase_dn(entry_dn, target_dn, new_target_dn)
+            new_entry = self.connection.server.dit[entry_dn].copy()
+            if entry_dn.lower() == target_dn.lower():
+                self._apply_rdn_attributes(new_entry, new_rdn, delete_old_rdn, old_rdn)
+            new_entry['entryDN'] = [to_raw(new_dn)]
+            moved[entry_dn] = (new_dn, new_entry)
+
+        with self.connection.server.dit_lock:
+            backup = {entry_dn: self.connection.server.dit[entry_dn] for entry_dn in affected_dns}
+            inserted_dns = []
+            try:
+                for entry_dn in affected_dns:  # deepest first, parents are removed before their old slot is reused
+                    del self.connection.server.dit[entry_dn]
+                for entry_dn, (new_dn, new_entry) in moved.items():
+                    self._store_mock_entry(new_dn, new_entry)
+                    inserted_dns.append(new_dn)
+            except Exception:
+                # removes any entry already written in the new location, then restores the original subtree
+                for new_dn in inserted_dns:
+                    if new_dn in self.connection.server.dit:
+                        del self.connection.server.dit[new_dn]
+                for entry_dn in affected_dns:
+                    self.connection.server.dit[entry_dn] = backup[entry_dn]
+                raise
+
+        new_identity = None
+        if self.bound and self.bound != '<anonymous>':
+            for entry_dn, (new_dn, _) in moved.items():
+                if self.bound.lower() == entry_dn.lower():
+                    new_identity = new_dn
+                    break
+        return new_identity
+
+    def _store_mock_entry(self, dn, entry):
+        """Single write point used by the ModifyDN commit, kept separate so failures can be injected in tests."""
+        self.connection.server.dit[dn] = entry
+
     def mock_modify_dn(self, request_message, controls):
         # ModifyDNRequest ::= [APPLICATION 12] SEQUENCE {
         #     entry           LDAPDN,
@@ -440,43 +545,83 @@ class MockBaseStrategy(object):
         # request: entry, newRdn, deleteOldRdn, newSuperior
         # response: LDAPResult
         request = modify_dn_request_to_dict(request_message)
-        dn = safe_dn(request['entry'])
-        new_rdn = request['newRdn']
+        try:
+            dn = safe_dn(request['entry'])
+            new_rdn = safe_dn(request['newRdn']) if request['newRdn'] else ''
+            new_superior = safe_dn(request['newSuperior']) if request['newSuperior'] else ''
+            if not new_rdn:
+                raise LDAPInvalidDnError('newRdn is mandatory')
+            safe_rdn(new_rdn, decompose=True)  # validates the RDN syntax, including multi-valued RDNs
+        except LDAPInvalidDnError:
+            return {'resultCode': RESULT_INVALID_DN_SYNTAX,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode('invalid DN or RDN syntax', SERVER_ENCODING),
+                    'referral': None
+                    }
+
         delete_old_rdn = request['deleteOldRdn']
-        new_superior = safe_dn(request['newSuperior']) if request['newSuperior'] else ''
-        dn_components = to_dn(dn)
-        if dn in self.connection.server.dit:
-            if new_superior and new_rdn:  # performs move in the DIT
-                new_dn = safe_dn(dn_components[0] + ',' + new_superior)
-                self.connection.server.dit[new_dn] = self.connection.server.dit[dn].copy()
-                moved_entry = self.connection.server.dit[new_dn]
-                if delete_old_rdn:
-                    del self.connection.server.dit[dn]
-                result_code = RESULT_SUCCESS
-                message = 'entry moved'
-                moved_entry['entryDN'] = [to_raw(new_dn)]
-            elif new_rdn and not new_superior:  # performs rename
-                new_dn = safe_dn(new_rdn + ',' + safe_dn(dn_components[1:]))
-                self.connection.server.dit[new_dn] = self.connection.server.dit[dn].copy()
-                renamed_entry = self.connection.server.dit[new_dn]
-                del self.connection.server.dit[dn]
-                renamed_entry['entryDN'] = [to_raw(new_dn)]
 
-                for rdn in safe_rdn(new_dn, decompose=True):  # adds rdns to entry attributes
-                    renamed_entry[rdn[0]] = [to_raw(rdn[1])]
-
-                result_code = RESULT_SUCCESS
-                message = 'entry rdn renamed'
-            else:
-                result_code = RESULT_UNWILLING_TO_PERFORM
-                message = 'newRdn or newSuperior missing'
-        else:
+        if dn not in self.connection.server.dit:
             result_code = RESULT_NO_SUCH_OBJECT
             message = 'object not found'
+            return {'resultCode': result_code,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                    'referral': None
+                    }
 
-        return {'resultCode': result_code,
+        if new_superior:  # move, the new RDN is combined with the (possibly new) superior entry
+            if new_superior not in self.connection.server.dit:
+                result_code = RESULT_NO_SUCH_OBJECT
+                message = 'newSuperior not found'
+            elif self._dn_ends_with(new_superior, dn):  # cannot move an entry beneath itself or one of its descendants
+                result_code = RESULT_LOOP_DETECTED
+                message = 'cannot move an entry under one of its descendants'
+            else:
+                new_target_dn = safe_dn(new_rdn + ',' + new_superior)
+                result_code = None
+        else:  # in-place rename, the current superior entry is preserved
+            superior_components = to_dn(dn)[1:]
+            new_target_dn = safe_dn(new_rdn + (',' + safe_dn(superior_components) if superior_components else ''))
+            result_code = None
+
+        if result_code is None:
+            if new_target_dn.lower() == dn.lower():  # no-op rename/move, nothing must change
+                result_code = RESULT_SUCCESS
+                message = 'entry already has the requested DN'
+            elif new_target_dn in self.connection.server.dit:  # target slot is taken by an entry outside the moved subtree
+                result_code = RESULT_ENTRY_ALREADY_EXISTS
+                message = 'target entry already exists'
+
+        if result_code is not None:
+            return {'resultCode': result_code,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                    'referral': None
+                    }
+
+        try:
+            new_identity = self._commit_modify_dn(dn, new_target_dn, new_rdn, delete_old_rdn)
+        except LDAPInvalidDnError:
+            return {'resultCode': RESULT_INVALID_DN_SYNTAX,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode('invalid DN or RDN syntax', SERVER_ENCODING),
+                    'referral': None
+                    }
+        except Exception as exc:  # the commit restores the original tree before signalling the failure
+            return {'resultCode': RESULT_OPERATIONS_ERROR,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode('modifyDN failed, subtree restored: ' + str(exc), SERVER_ENCODING),
+                    'referral': None
+                    }
+
+        # the mock tracks the bound identity by DN, so a successful move keeps the session pointing at the entry
+        if new_identity is not None:
+            self.bound = new_identity
+
+        return {'resultCode': RESULT_SUCCESS,
                 'matchedDN': '',
-                'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                'diagnosticMessage': to_unicode('entry and its subtree moved', SERVER_ENCODING),
                 'referral': None
                 }
 

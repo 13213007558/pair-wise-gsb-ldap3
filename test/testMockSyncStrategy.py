@@ -401,6 +401,7 @@ class Test(unittest.TestCase):
 
     def test_move_dn_1(self):
         dn = 'cn=user4,ou=test,o=lab'
+        self.connection_1.strategy.add_entry('ou=moved,o=lab', {})  # newSuperior must exist as per RFC 4511
         self.connection_1.bind()
         result = self.connection_1.modify_dn(dn, relative_dn='cn=user4', new_superior='ou=moved,o=lab')
         if not self.connection_1.strategy.sync:
@@ -413,6 +414,7 @@ class Test(unittest.TestCase):
 
     def test_move_dn_2(self):
         dn = 'cn=user4,ou=test,o=lab'
+        self.connection_2.strategy.add_entry('ou=moved,o=lab', {})  # newSuperior must exist as per RFC 4511
         self.connection_2.bind()
         result = self.connection_2.modify_dn(dn, relative_dn='cn=user4', new_superior='ou=moved,o=lab')
         if not self.connection_2.strategy.sync:
@@ -425,6 +427,7 @@ class Test(unittest.TestCase):
 
     def test_move_dn_3(self):
         dn = 'cn=user4,ou=test,o=lab'
+        self.connection_3.strategy.add_entry('ou=moved,o=lab', {})  # newSuperior must exist as per RFC 4511
         self.connection_3.bind()
         result = self.connection_3.modify_dn(dn, relative_dn='cn=user4', new_superior='ou=moved,o=lab')
         if not self.connection_3.strategy.sync:
