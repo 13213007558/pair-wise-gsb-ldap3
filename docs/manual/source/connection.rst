@@ -100,7 +100,7 @@ Connection parameters are:
 
 * use_referral_cache: when True referral connections are not immediately closed, and kept in a cache should another request need to contact the same server
 
-* auto_escape: automatically applies LDAP encoding to filter values, default to True
+* auto_escape: applies RFC4515 escaping to a filter assertion value while the filter string is being parsed, default to True. It is a convenience guard only: the filter is parsed into its filter tree before escaping runs, and escaping is applied only when the assertion value already contains a backslash that does not look like a valid hex escape. Values containing ``*``, ``(`` or ``)`` without a backslash are therefore not neutralized, and an unbalanced injected filter still raises an error at parse time. Always call ``escape_filter_chars()`` from ``ldap3.utils.conv`` on untrusted input before building the filter string; do not rely on ``auto_escape`` to undo string concatenation.
 
 * auto_encode: automatically tries to convert from local encoding to UTF8 for well known syntaxes and types, default to True
 

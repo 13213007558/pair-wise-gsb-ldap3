@@ -76,6 +76,13 @@ In the ldap3 library the signature for the Search operation is::
 .. warning::
     Make sure to call escape_filter_chars() from ldap3.utils.conv on any user input before placing it into a .search() call. This is to avoid possible injection of malicious code. Look at https://www.linkedin.com/pulse/ldap-injection-django-jerin-jose for more information.
 
+.. note::
+    ``Connection(auto_escape=True)`` does not replace this step. The filter string is parsed into the RFC4515 filter tree before the auto-escape check runs, and the check only escapes values that already contain a backslash which is not a valid ``\\HH`` escape. Input such as ``a*b`` or ``admin)(uid=*`` is interpreted as filter syntax (or rejected as malformed if the parentheses do not balance); it is never rewritten into a safe literal for you. Escape each untrusted value once, at the point where you concatenate it into the filter.
+
+    Filter values and Distinguished Name values follow different escaping rules and are not interchangeable: use ``escape_filter_chars`` (RFC4515) for assertion values and ``escape_rdn`` from ``ldap3.utils.dn`` (RFC4514) for DN components. ``escape_rdn`` does not escape ``*``, ``(`` or ``)``, so it cannot protect a search filter.
+
+    When a substring search is intended, add the structural ``*`` wildcards yourself and still escape the user-supplied term. For example ``"(cn=*" + escape_filter_chars(term) + "*)"`` keeps the substring match while a star typed by the user is sent as the literal ``\\2a`` instead of acting as a wildcard.
+
 
 The LDAP filter
 ---------------

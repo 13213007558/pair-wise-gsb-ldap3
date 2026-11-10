@@ -1,0 +1,41 @@
+--- a/docs/manual/source/connection.rst
++++ b/docs/manual/source/connection.rst
+@@ -100,7 +100,7 @@
+ 
+ * use_referral_cache: when True referral connections are not immediately closed, and kept in a cache should another request need to contact the same server
+ 
+-* auto_escape: automatically applies LDAP encoding to filter values, default to True
++* auto_escape: applies RFC4515 escaping to a filter assertion value while the filter string is being parsed, default to True. It is a convenience guard only: the filter is parsed into its filter tree before escaping runs, and escaping is applied only when the assertion value already contains a backslash that does not look like a valid hex escape. Values containing ``*``, ``(`` or ``)`` without a backslash are therefore not neutralized, and an unbalanced injected filter still raises an error at parse time. Always call ``escape_filter_chars()`` from ``ldap3.utils.conv`` on untrusted input before building the filter string; do not rely on ``auto_escape`` to undo string concatenation.
+ 
+ * auto_encode: automatically tries to convert from local encoding to UTF8 for well known syntaxes and types, default to True
+ 
+--- a/docs/manual/source/searches.rst
++++ b/docs/manual/source/searches.rst
+@@ -76,7 +76,14 @@
+ .. warning::
+     Make sure to call escape_filter_chars() from ldap3.utils.conv on any user input before placing it into a .search() call. This is to avoid possible injection of malicious code. Look at https://www.linkedin.com/pulse/ldap-injection-django-jerin-jose for more information.
+ 
++.. note::
++    ``Connection(auto_escape=True)`` does not replace this step. The filter string is parsed into the RFC4515 filter tree before the auto-escape check runs, and the check only escapes values that already contain a backslash which is not a valid ``\\HH`` escape. Input such as ``a*b`` or ``admin)(uid=*`` is interpreted as filter syntax (or rejected as malformed if the parentheses do not balance); it is never rewritten into a safe literal for you. Escape each untrusted value once, at the point where you concatenate it into the filter.
+ 
++    Filter values and Distinguished Name values follow different escaping rules and are not interchangeable: use ``escape_filter_chars`` (RFC4515) for assertion values and ``escape_rdn`` from ``ldap3.utils.dn`` (RFC4514) for DN components. ``escape_rdn`` does not escape ``*``, ``(`` or ``)``, so it cannot protect a search filter.
++
++    When a substring search is intended, add the structural ``*`` wildcards yourself and still escape the user-supplied term. For example ``"(cn=*" + escape_filter_chars(term) + "*)"`` keeps the substring match while a star typed by the user is sent as the literal ``\\2a`` instead of acting as a wildcard.
++
++
+ The LDAP filter
+ ---------------
+ 
+--- a/docs/manual/source/conv.rst
++++ b/docs/manual/source/conv.rst
+@@ -8,8 +8,8 @@
+ 
+ - ``to_raw((obj, encoding='utf-8')``: converts a string to bytes, using the specified encoding (default is utf-8)
+ 
+-- ``escape_filter_chars(text, encoding=None):``: escapes a string for using as a value in a filter assertion. Escaping is defined in RFC4515. If no
+-  encoding is defined tries to use the local environment encoding.
++- ``escape_filter_chars(text, encoding=None):``: escapes a string for using as a value in a filter assertion. Escaping is defined in RFC4515 (``*`` -> ``\\2a``, ``(`` -> ``\\28``, ``)`` -> ``\\29``, ``\\`` -> ``\\5c``, the NUL byte -> ``\\00``). If no
++  encoding is defined tries to use the local environment encoding. Call it exactly once on each untrusted value before concatenating the filter string; escaping an already-escaped value a second time doubles the backslashes. This is the correct function for filter assertion values only -- for values embedded in a Distinguished Name use ``escape_rdn`` from ``ldap3.utils.dn`` (RFC4514), which escapes a different character set.
+ 
+ - `escape_bytes(bytes_value)``: applies LDAP escaping to a sequence of byte values so that it can be used in an LDAP Add or Modify operation.
+ 
