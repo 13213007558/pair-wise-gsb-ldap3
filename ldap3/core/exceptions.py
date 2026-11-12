@@ -514,6 +514,24 @@ class LDAPTransactionError(LDAPExceptionError):
     pass
 
 
+class LDAPPagedSearchContextError(LDAPExceptionError):
+    """A paged search cookie is being used outside the search context that created it."""
+    pass
+
+
+class LDAPPagedSearchCursorReleaseError(LDAPExceptionError):
+    """The server-side cursor of an abandoned paged search could not be released.
+
+    The release status ('released', 'disconnected' or 'unknown') is kept in
+    ``status`` so callers can tell an acknowledged release from a connection
+    loss and from an unconfirmed attempt. No directory data or credentials are
+    included in the message.
+    """
+    def __init__(self, message, status):
+        LDAPExceptionError.__init__(self, message)
+        self.status = status
+
+
 class LDAPInfoError(LDAPExceptionError):
     pass
 

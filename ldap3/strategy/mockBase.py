@@ -646,6 +646,16 @@ class MockBaseStrategy(object):
                     else:
                         for paged_set in self._paged_sets:
                             if paged_set.cookie == decoded_control[1]['value']['cookie']: # existing paged set
+                                if int(decoded_control[1]['value']['size']) == 0:  # RFC 2696: size 0 releases the server-side cursor
+                                    self._paged_sets.remove(paged_set)
+                                    release_control = paged_search_control(decoded_control[1]['criticality'], 0, '')
+                                    result = {'resultCode': RESULT_SUCCESS,
+                                              'matchedDN': '',
+                                              'diagnosticMessage': to_unicode('', SERVER_ENCODING),
+                                              'referral': None,
+                                              'controls': [BaseStrategy.decode_control(release_control)]
+                                              }
+                                    return [], result
                                 response, result = paged_set.next()  # returns next bunch of entries as per paged set specifications
                                 if paged_set.done:
                                     self._paged_sets.remove(paged_set)
